@@ -421,7 +421,8 @@ impl RemoteTaskManager {
                 Self::route_message(&mut inner, &route, &inbound.binding, generation, text, inbound.chat)
             }
             ParsedInbound::Command(TaskCommand::Create { goal }) => {
-                Self::create_task(&mut inner, &route, &inbound.binding, generation, goal)
+                // 显式 /new 命令：强制建任务，不参与闲聊判定
+                Self::create_task(&mut inner, &route, &inbound.binding, generation, goal, false)
             }
             ParsedInbound::Command(TaskCommand::Steer { task_id, text }) => Self::steer_explicit(
                 &mut inner,
@@ -573,7 +574,8 @@ impl RemoteTaskManager {
         if rec.binding.conversation_id.is_none() {
             return DispatchOutcome::Reply(format!("任务 #{} 不可继续（会话未建立）。", task_id));
         }
-        Self::steer_existing(inner, route, binding, generation, task_id, text)
+        // 显式 /stop-id + 文本：始终按任务推进处理，不走闲聊
+        Self::steer_existing(inner, route, binding, generation, task_id, text, false)
     }
 
     /// Steer 推进：同会话追加一轮，记录回到 Running。

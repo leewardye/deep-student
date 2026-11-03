@@ -173,6 +173,7 @@ pub fn ingest(
 /// 幂等：同内容由 VFS 内容哈希去重，重复注册返回已有 ID。
 /// 失败不阻断消息主流程——附件仍有本地路径可用。
 pub fn register_vfs(app: &tauri::AppHandle, att: &mut IngestedAttachment) {
+    use tauri::Manager;
     let result = (|| -> Result<String, AppError> {
         let db = app
             .try_state::<std::sync::Arc<crate::vfs::VfsDatabase>>()
