@@ -21,6 +21,7 @@ use crate::chat_v2::task_command::{self, RemoteTaskManager};
 use crate::database::Database;
 use crate::models::AppError;
 use crate::plugins::events;
+use crate::plugins::im_chat;
 use crate::plugins::im_core::{
     attachment_manifest, chunk_text, AttachKind, ImChannel, InboundAttachment, UnifiedInbound,
 };
@@ -45,6 +46,8 @@ const OUTBOUND_CHUNK_LIMIT: usize = 4000;
 const DEFAULT_REMOTE_SYSTEM_APPEND: &str = "你正在通过飞书机器人远程协助用户。回复使用简洁、友善的简体中文纯文本，结论先行、长度适中。你没有本地文件写入/命令执行权限；涉及写操作的请求请告知用户在桌面端确认。用户发来的图片/文件已落盘，路径见消息中的附件清单。";
 /// 同时运行的远程任务上限
 const MAX_CONCURRENT_TASKS: usize = 3;
+/// 每个会话保留的最近入站文本条数（供闲聊意图分类器参考）
+const CHAT_HISTORY_PER_PEER: usize = 10;
 /// WS 断线重连的最大退避
 const MAX_RECONNECT_DELAY_SECS: u64 = 30;
 
@@ -60,6 +63,8 @@ pub struct FeishuBotPlugin {
     /// 远程任务注册表（路由/幂等/隔离，与 ilink_bot 同构）
     tasks: Arc<RemoteTaskManager>,
     last_activity: Mutex<Option<String>>,
+    /// 闲聊意图分类的最近入站文本（chat_id → 队列，仅内存，重启即清）
+    chat_recent: Mutex<std::collections::HashMap<String, std::collections::VecDeque<String>>>,
 }
 
 impl FeishuBotPlugin {
@@ -68,6 +73,7 @@ impl FeishuBotPlugin {
             client: FeishuClient::new(),
             tasks: Arc::new(RemoteTaskManager::default()),
             last_activity: Mutex::new(None),
+            chat_recent: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -304,7 +310,10 @@ impl FeishuBotPlugin {
                         att.kind,
                         &bytes,
                     ) {
-                        Ok(item) => ok.push(item),
+                        Ok(mut item) => {
+                            im_media::register_vfs(&ctx.app, &mut item);
+                            ok.push(item);
+                        }
                         Err(e) => errors.push(format!("附件 {} 入库失败: {}", i + 1, e)),
                     }
                 }
@@ -482,10 +491,43 @@ impl FeishuBotPlugin {
             format!("f{}", inbound.msg_id)
         };
 
+        // —— 闲聊意图判定（仅普通消息；命令/帮助不分类）——
+        let is_plain_message = matches!(
+            task_command::parse_inbound(&full_text),
+            task_command::ParsedInbound::Message(_)
+        );
+        let chat = if is_plain_message {
+            let recent: Vec<String> = self
+                .chat_recent
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&inbound.chat_id).cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            match im_chat::is_chat_intent(&ctx.app, &recent, &full_text).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!("[feishubot] 意图分类失败，按任务处理: {}", e);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if let Ok(mut m) = self.chat_recent.lock() {
+            let dq = m.entry(inbound.chat_id.clone()).or_default();
+            dq.push_back(full_text.clone());
+            while dq.len() > CHAT_HISTORY_PER_PEER {
+                dq.pop_front();
+            }
+        }
+
         let outcome = self.tasks.dispatch(task_command::InboundRemote {
             binding,
             message_id: dedup_key,
             text: full_text.clone(),
+            chat,
         });
 
         match outcome {
@@ -506,11 +548,14 @@ impl FeishuBotPlugin {
                 let _ = self.send_reply(ctx, creds, &inbound.chat_id, &reply).await;
             }
             task_command::DispatchOutcome::Launch { ack, plan } => {
-                if let Err(e) = self
-                    .send_reply(ctx, creds, &inbound.chat_id, &ack)
-                    .await
-                {
-                    tracing::warn!("[feishubot] send ack failed: {}", e);
+                // 闲聊轮 ack 为空：静默启动，回复即结果
+                if !ack.is_empty() {
+                    if let Err(e) = self
+                        .send_reply(ctx, creds, &inbound.chat_id, &ack)
+                        .await
+                    {
+                        tracing::warn!("[feishubot] send ack failed: {}", e);
+                    }
                 }
                 let model_id = Self::read_setting(
                     db,
@@ -518,14 +563,18 @@ impl FeishuBotPlugin {
                 );
                 let system_prompt =
                     Self::read_setting(db, &format!("{}system_prompt", SETTINGS_PREFIX));
-                let system_append = Some(
-                    system_prompt
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(DEFAULT_REMOTE_SYSTEM_APPEND)
-                        .to_string(),
-                );
+                let system_append = if plan.chat {
+                    Some(im_chat::CHAT_SYSTEM_APPEND.to_string())
+                } else {
+                    Some(
+                        system_prompt
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(DEFAULT_REMOTE_SYSTEM_APPEND)
+                            .to_string(),
+                    )
+                };
                 let permit = match task_slots.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {

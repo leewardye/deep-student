@@ -234,9 +234,11 @@ pub fn parse_inbound(text: &str) -> ParsedInbound {
 pub fn help_text() -> String {
     "我可以把消息当作任务交给桌面端的 Deep Student 执行：\n\
      · 直接发消息 = 创建任务（任务运行中再发 = 忙线提示，完成后发 = 继续该任务）\n\
+     · 简单的提问和闲聊我会直接回答，不会创建任务\n\
      · /new <目标> = 强制创建新任务\n\
      · 停止 或 /stop = 停止当前任务\n\
      · 进展 或 /status = 查看任务状态\n\
+     · 发送图片/文件会自动存入资源库，并在回复里告诉你路径\n\
      · 写操作审批需在桌面端确认"
         .to_string()
 }
@@ -301,6 +303,9 @@ pub struct InboundRemote {
     pub message_id: String,
     /// 消息文本
     pub text: String,
+    /// 闲聊意图：true = 由 IM 侧意图分类器判定为普通对话，
+    /// 路由时静默启动（无「已创建任务」确认），会话用闲聊提示词
+    pub chat: bool,
 }
 
 /// 待执行的 headless turn 计划
@@ -317,6 +322,8 @@ pub struct PlannedTurn {
     pub existing_session_id: Option<String>,
     /// 已赋值 generation 的绑定
     pub binding: RemoteBinding,
+    /// 闲聊轮：无任务确认、使用闲聊 system prompt
+    pub chat: bool,
 }
 
 /// dispatch 结果：调用方据此回复/启动/取消
@@ -411,7 +418,7 @@ impl RemoteTaskManager {
         match parse_inbound(&inbound.text) {
             ParsedInbound::Help => DispatchOutcome::Reply(help_text()),
             ParsedInbound::Message(text) => {
-                Self::route_message(&mut inner, &route, &inbound.binding, generation, text)
+                Self::route_message(&mut inner, &route, &inbound.binding, generation, text, inbound.chat)
             }
             ParsedInbound::Command(TaskCommand::Create { goal }) => {
                 Self::create_task(&mut inner, &route, &inbound.binding, generation, goal)
@@ -444,6 +451,7 @@ impl RemoteTaskManager {
         binding: &RemoteBinding,
         generation: u64,
         text: String,
+        chat: bool,
     ) -> DispatchOutcome {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -474,10 +482,10 @@ impl RemoteTaskManager {
                 .get(&latest_id)
                 .is_some_and(|r| r.status.is_terminal() && r.binding.conversation_id.is_some());
             if steerable {
-                return Self::steer_existing(inner, route, binding, generation, &latest_id, text);
+                return Self::steer_existing(inner, route, binding, generation, &latest_id, text, chat);
             }
         }
-        Self::create_task(inner, route, binding, generation, text)
+        Self::create_task(inner, route, binding, generation, text, chat)
     }
 
     /// Create：登记 Running 记录并返回 Launch 计划（会话由调用方创建后 attach）。
@@ -487,6 +495,7 @@ impl RemoteTaskManager {
         binding: &RemoteBinding,
         generation: u64,
         goal: String,
+        chat: bool,
     ) -> DispatchOutcome {
         let goal = goal.trim().to_string();
         if goal.is_empty() {
@@ -515,17 +524,27 @@ impl RemoteTaskManager {
         rs.latest_task = Some(task_id.clone());
         Self::evict_if_needed(inner);
         DispatchOutcome::Launch {
-            ack: format!(
-                "已创建任务 #{}，正在运行。\n完成后会主动通知你；发送「停止」可中止，发送「进展」查看状态。",
-                task_id
-            ),
+            ack: if chat {
+                // 闲聊轮静默启动：不打断对话感，回复即结果
+                String::new()
+            } else {
+                format!(
+                    "已创建任务 #{}，正在运行。\n完成后会主动通知你；发送「停止」可中止，发送「进展」查看状态。",
+                    task_id
+                )
+            },
             plan: PlannedTurn {
                 task_id,
                 prompt: goal.clone(),
-                title: format!("远程任务 {}", truncate_chars(&goal, 20)),
+                title: format!(
+                    "{} {}",
+                    if chat { "闲聊" } else { "远程任务" },
+                    truncate_chars(&goal, 20)
+                ),
                 source: format!("remote_task:{}:{}", route.channel, route.thread_id),
                 existing_session_id: None,
                 binding: bound,
+                chat,
             },
         }
     }
@@ -565,6 +584,7 @@ impl RemoteTaskManager {
         generation: u64,
         task_id: &str,
         text: String,
+        chat: bool,
     ) -> DispatchOutcome {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -587,14 +607,23 @@ impl RemoteTaskManager {
         rs.active_task = Some(task_id.to_string());
         let _ = binding;
         DispatchOutcome::Launch {
-            ack: format!("已继续任务 #{}，正在运行。", task_id),
+            ack: if chat {
+                String::new()
+            } else {
+                format!("已继续任务 #{}，正在运行。", task_id)
+            },
             plan: PlannedTurn {
                 task_id: task_id.to_string(),
                 prompt: text,
-                title: format!("远程任务 {}", goal_preview),
+                title: format!(
+                    "{} {}",
+                    if chat { "闲聊" } else { "远程任务" },
+                    goal_preview
+                ),
                 source: format!("remote_task:{}:{}", route.channel, route.thread_id),
                 existing_session_id: session_id,
                 binding: plan_binding,
+                chat,
             },
         }
     }
@@ -974,6 +1003,7 @@ mod tests {
             binding: binding(thread),
             message_id: message_id.into(),
             text: text.into(),
+            chat: false,
         }
     }
 
@@ -1222,6 +1252,7 @@ mod tests {
             binding: foreign,
             message_id: "y1".into(),
             text: format!("/stop {}", task_id),
+            chat: false,
         }));
         assert!(reply.contains("未找到"));
         assert_eq!(

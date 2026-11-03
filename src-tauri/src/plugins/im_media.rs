@@ -151,6 +151,7 @@ pub fn ingest(
                 local_path: path.to_string_lossy().into_owned(),
                 display_name,
                 kind,
+                vfs_id: None,
             });
         }
     }
@@ -164,7 +165,69 @@ pub fn ingest(
         local_path: path.to_string_lossy().into_owned(),
         display_name,
         kind,
+        vfs_id: None,
     })
+}
+
+/// 把已落盘的附件注册进 VFS 资源库（agent 的附件工具/桌面端资源库都能引用）。
+/// 幂等：同内容由 VFS 内容哈希去重，重复注册返回已有 ID。
+/// 失败不阻断消息主流程——附件仍有本地路径可用。
+pub fn register_vfs(app: &tauri::AppHandle, att: &mut IngestedAttachment) {
+    let result = (|| -> Result<String, AppError> {
+        let db = app
+            .try_state::<std::sync::Arc<crate::vfs::VfsDatabase>>()
+            .ok_or_else(|| AppError::internal("VfsDatabase 未初始化"))?
+            .inner()
+            .clone();
+        let bytes = std::fs::read(&att.local_path)
+            .map_err(|e| AppError::internal(format!("读取附件失败: {}", e)))?;
+        let b64 = use_base64(&bytes);
+        let params = crate::vfs::types::VfsUploadAttachmentParams {
+            name: att.display_name.clone(),
+            mime_type: mime_for(att).to_string(),
+            base64_content: b64,
+            attachment_type: Some(match att.kind {
+                crate::plugins::im_core::AttachKind::Image => "image".to_string(),
+                _ => "file".to_string(),
+            }),
+        };
+        let result = crate::vfs::repos::VfsAttachmentRepo::upload_with_folder(
+            &db, params, None,
+        )
+        .map_err(|e| AppError::internal(format!("VFS 注册失败: {}", e)))?;
+        Ok(result.source_id)
+    })();
+    match result {
+        Ok(id) => att.vfs_id = Some(id),
+        Err(e) => tracing::warn!("[im_media] VFS 注册失败（不阻断）: {}", e),
+    }
+}
+
+/// 依据扩展名/类别推断 MIME（上传白名单已保证是常见类型）
+fn mime_for(att: &IngestedAttachment) -> &'static str {
+    let name = att.display_name.to_ascii_lowercase();
+    if name.ends_with(".png") {
+        "image/png"
+    } else if name.ends_with(".jpg") || name.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if name.ends_with(".webp") {
+        "image/webp"
+    } else if name.ends_with(".gif") {
+        "image/gif"
+    } else if name.ends_with(".pdf") {
+        "application/pdf"
+    } else {
+        match att.kind {
+            crate::plugins::im_core::AttachKind::Image => "image/png",
+            _ => "application/octet-stream",
+        }
+    }
+}
+
+/// 标准 base64（无换行）
+fn use_base64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 #[cfg(test)]

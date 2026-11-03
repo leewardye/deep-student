@@ -120,6 +120,8 @@ pub struct IngestedAttachment {
     pub local_path: String,
     pub display_name: String,
     pub kind: AttachKind,
+    /// VFS 资源库附件 ID（ingest 后由 register_vfs 填充；agent/桌面端可引用）
+    pub vfs_id: Option<String>,
 }
 
 /// 附件清单文本：附加到用户消息后，让 headless agent 知道有哪些落盘文件。
@@ -132,13 +134,23 @@ pub fn attachment_manifest(items: &[IngestedAttachment]) -> String {
     out.push_str(&items.len().to_string());
     out.push_str(" 个]");
     for (i, it) in items.iter().enumerate() {
-        out.push_str(&format!(
-            "\n{}. [{}] {} → {}",
-            i + 1,
-            it.kind.as_str(),
-            it.display_name,
-            it.local_path
-        ));
+        match &it.vfs_id {
+            Some(id) => out.push_str(&format!(
+                "\n{}. [{}] {} → 本地 {}，资源库附件 ID {}",
+                i + 1,
+                it.kind.as_str(),
+                it.display_name,
+                it.local_path,
+                id
+            )),
+            None => out.push_str(&format!(
+                "\n{}. [{}] {} → {}",
+                i + 1,
+                it.kind.as_str(),
+                it.display_name,
+                it.local_path
+            )),
+        }
     }
     out
 }
@@ -174,6 +186,7 @@ mod tests {
             local_path: "/tmp/a.jpg".into(),
             display_name: "错题.jpg".into(),
             kind: AttachKind::Image,
+            vfs_id: None,
         }];
         let m = attachment_manifest(&items);
         assert!(m.contains("[附件已入库，共 1 个]"));

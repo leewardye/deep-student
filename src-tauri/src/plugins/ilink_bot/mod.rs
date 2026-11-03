@@ -22,6 +22,7 @@ use crate::chat_v2::task_command::{self, RemoteTaskManager};
 use crate::database::Database;
 use crate::models::AppError;
 use crate::plugins::events;
+use crate::plugins::im_chat;
 use crate::plugins::im_core::{attachment_manifest, ImChannel, IngestedAttachment};
 use crate::plugins::im_media;
 use crate::plugins::manager::PluginManager;
@@ -35,6 +36,9 @@ use client::{
     probe_media_url, IlinkClient, IlinkCredentials, DEFAULT_LONG_POLL_TIMEOUT_MS,
 };
 use guard::{is_bound_user, RateLimiter};
+
+/// 每个用户保留的最近入站文本条数（供闲聊意图分类器参考）
+const CHAT_HISTORY_PER_PEER: usize = 10;
 
 pub const PLUGIN_ID: &str = "ilinkbot";
 pub const CREDENTIALS_KEY: &str = "plugin.ilinkbot.credentials";
@@ -67,6 +71,8 @@ pub struct IlinkBotPlugin {
     tasks: Arc<RemoteTaskManager>,
     ui: SharedUi,
     login_running: AtomicBool,
+    /// 闲聊意图分类的最近入站文本（peer → 队列，仅内存，重启即清）
+    chat_recent: Mutex<std::collections::HashMap<String, std::collections::VecDeque<String>>>,
 }
 
 impl IlinkBotPlugin {
@@ -81,6 +87,7 @@ impl IlinkBotPlugin {
                 login_cancel: Mutex::new(None),
             },
             login_running: AtomicBool::new(false),
+            chat_recent: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -435,7 +442,10 @@ impl IlinkBotPlugin {
                                                     media_kind(item),
                                                     &bytes,
                                                 ) {
-                                                    Ok(a) => ingested.push(a),
+                                                    Ok(mut a) => {
+                                                        im_media::register_vfs(&ctx.app, &mut a);
+                                                        ingested.push(a);
+                                                    }
                                                     Err(e) => media_notes
                                                         .push(format!("附件 {} 入库失败: {}", i + 1, e)),
                                                 }
@@ -546,10 +556,50 @@ impl IlinkBotPlugin {
                                     })
                                     .unwrap_or_default();
 
+                                // —— 闲聊意图判定（仅普通消息；命令/帮助不分类）——
+                                // 分类用分类前的历史；失败保守回退为任务模式
+                                let is_plain_message = matches!(
+                                    task_command::parse_inbound(&full_text),
+                                    task_command::ParsedInbound::Message(_)
+                                );
+                                let chat = if is_plain_message {
+                                    let recent: Vec<String> = self
+                                        .chat_recent
+                                        .lock()
+                                        .ok()
+                                        .and_then(|m| m.get(&peer).cloned())
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .collect();
+                                    let verdict =
+                                        im_chat::is_chat_intent(&ctx.app, &recent, &full_text)
+                                            .await;
+                                    match verdict {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                "[ilinkbot] 意图分类失败，按任务处理: {}",
+                                                e
+                                            );
+                                            false
+                                        }
+                                    }
+                                } else {
+                                    false
+                                };
+                                if let Ok(mut m) = self.chat_recent.lock() {
+                                    let dq = m.entry(peer.clone()).or_default();
+                                    dq.push_back(full_text.clone());
+                                    while dq.len() > CHAT_HISTORY_PER_PEER {
+                                        dq.pop_front();
+                                    }
+                                }
+
                                 let outcome = self.tasks.dispatch(task_command::InboundRemote {
                                     binding,
                                     message_id: dedup_key,
                                     text: full_text.clone(),
+                                    chat,
                                 });
 
                                 match outcome {
@@ -575,25 +625,34 @@ impl IlinkBotPlugin {
                                         self.send_reply(&ctx, &creds, &peer, &ctx_token, &reply).await?;
                                     }
                                     task_command::DispatchOutcome::Launch { ack, plan } => {
-                                        self.send_reply(&ctx, &creds, &peer, &ctx_token, &ack).await?;
+                                        // 闲聊轮 ack 为空：静默启动，回复即结果
+                                        if !ack.is_empty() {
+                                            self.send_reply(&ctx, &creds, &peer, &ctx_token, &ack)
+                                                .await?;
+                                        }
                                         // Read the current settings for every turn so a model
                                         // or prompt change does not require reconnecting WeChat.
                                         let model_id = Self::read_setting(
                                             &ctx.database,
                                             "plugin.ilinkbot.model_config_id",
                                         );
+                                        // 闲聊轮用闲聊提示词（不叠加任务模式的远程汇报腔）
                                         let system_prompt = Self::read_setting(
                                             &ctx.database,
                                             "plugin.ilinkbot.system_prompt",
                                         );
-                                        let system_append = Some(
-                                            system_prompt
-                                                .as_deref()
-                                                .map(str::trim)
-                                                .filter(|s| !s.is_empty())
-                                                .unwrap_or(DEFAULT_REMOTE_SYSTEM_APPEND)
-                                                .to_string(),
-                                        );
+                                        let system_append = if plan.chat {
+                                            Some(im_chat::CHAT_SYSTEM_APPEND.to_string())
+                                        } else {
+                                            Some(
+                                                system_prompt
+                                                    .as_deref()
+                                                    .map(str::trim)
+                                                    .filter(|s| !s.is_empty())
+                                                    .unwrap_or(DEFAULT_REMOTE_SYSTEM_APPEND)
+                                                    .to_string(),
+                                            )
+                                        };
                                         let permit = match task_slots.clone().try_acquire_owned() {
                                             Ok(p) => p,
                                             Err(_) => {
