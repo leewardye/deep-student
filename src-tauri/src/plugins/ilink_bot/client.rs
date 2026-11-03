@@ -154,7 +154,7 @@ pub fn probe_media_url(item: &MessageItem) -> Option<String> {
 
 /// item 是否疑似图片类型。type 编号未文档化：type==1 已知是文本，
 /// 其余按「非文本即媒体」处理，具体分类留给协议 spike。
-pub fn media_kind(item: &MessageItem) -> crate::plugins::im_core::AttachKind {
+pub fn media_kind(_item: &MessageItem) -> crate::plugins::im_core::AttachKind {
     // 目前只有文本(type 1)已知；图片/文件分类无法区分时一律按图片处理
     // （学生场景绝大多数是拍照错题），文件类会以后缀名修正。
     crate::plugins::im_core::AttachKind::Image

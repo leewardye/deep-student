@@ -224,7 +224,13 @@ impl FeishuBotPlugin {
                 let mut buf = String::new();
                 if let Some(blocks) = content.get("content").and_then(|v| v.as_array()) {
                     for block in blocks {
-                        for seg in block.iter().filter_map(|s| s.as_object()) {
+                        // 段落是 segment 数组；部分客户端发单对象形式，两种都兼容
+                        let segments: Vec<&serde_json::Value> = match block {
+                            serde_json::Value::Array(items) => items.iter().collect(),
+                            obj @ serde_json::Value::Object(_) => vec![obj],
+                            _ => Vec::new(),
+                        };
+                        for seg in segments.iter().filter_map(|s| s.as_object()) {
                             if seg.get("tag").and_then(|t| t.as_str()) == Some("text") {
                                 if let Some(t) = seg.get("text").and_then(|t| t.as_str()) {
                                     buf.push_str(t);
