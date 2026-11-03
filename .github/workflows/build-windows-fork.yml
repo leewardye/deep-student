@@ -1,0 +1,106 @@
+# Fork 云端构建：Windows NSIS 安装包（无签名）
+#
+# 用途：在 fork 仓库里把 feat/im-channels 分支编译成可安装的桌面端。
+# 与官方 release 流水线的差别：
+#   - 跳过 Authenticode 代码签名（无证书 secrets，安装时 SmartScreen 会提示，仍可运行）
+#   - updater 密钥用 CI 内生成的临时密钥（不影响本地使用，只是不能用官方自动更新）
+#   - 不上传 Sentry / R2，产物以 workflow artifact 形式下载
+#
+# 触发：push 到 feat/im-channels，或手动 workflow_dispatch。
+# 首次构建无缓存，预计 1.5~3 小时；后续构建命中 rust-cache/sccache 会快很多。
+
+name: Build Windows (fork)
+
+on:
+  push:
+    branches: [feat/im-channels]
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-windows-fork-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEEP_STUDENT_BUILD_NUMBER: '14639'
+  NODE_OPTIONS: '--max-old-space-size=4096'
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  SCCACHE_GHA_ENABLED: 'true'
+  SCCACHE_IDLE_TIMEOUT: '0'
+  SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+  SENTRY_UPLOAD_ENABLED: 'false'
+
+jobs:
+  build:
+    name: Build NSIS installer (unsigned)
+    runs-on: windows-2022
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Setup Rust 1.98.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.1'
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Rust cache (target dir)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri'
+          cache-all-crates: 'true'
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      - name: Install frontend dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Generate version info
+        run: node scripts/generate-version.mjs
+
+      - name: Generate throwaway updater signing key
+        shell: bash
+        env:
+          UPDATER_KEY_PASSWORD: 'ci-build-only'
+        run: |
+          cd src-tauri
+          npx --yes @tauri-apps/cli signer generate -w ci-updater.key --password "$UPDATER_KEY_PASSWORD" --force
+          echo "TAURI_SIGNING_PRIVATE_KEY=$(cat ci-updater.key)" >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$UPDATER_KEY_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Build (vite + tauri)
+        shell: bash
+        run: |
+          export RUSTC_WRAPPER=sccache
+          npx tauri build
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p dist-upload
+          find src-tauri/target/release/bundle -type f \( -name "*.exe" -o -name "*.zip" -o -name "*.sig" \) -exec cp {} dist-upload/ \;
+          ls -la dist-upload/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepStudent-Windows-unsigned
+          path: dist-upload/
+          if-no-files-found: error
+          retention-days: 14
