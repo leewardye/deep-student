@@ -44,6 +44,11 @@ export interface IlinkBotConfig {
   accountId: string;
   userId: string;
   baseUrl: string;
+  /** feishubot 扩展字段（get_public_config 返回） */
+  appId?: string;
+  hasSecret?: boolean;
+  configured?: boolean;
+  boundOpenId?: string;
 }
 
 export const PLUGIN_EVENTS = {

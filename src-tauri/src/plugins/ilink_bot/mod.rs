@@ -6,7 +6,7 @@
 //! Approve 仅返回桌面端确认指引（远程批准写操作属 P2）。
 
 mod client;
-mod guard;
+pub(crate) mod guard; // 绑定校验 + 限流器，由 feishu_bot 等 IM 通道复用
 pub(crate) use dstu_util::qr; // 二维码 PNG（base64）已下沉 dstu-util
 
 use async_trait::async_trait;

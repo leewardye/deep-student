@@ -15,6 +15,7 @@ use crate::models::AppError;
 
 use super::events;
 use super::ilink_bot::IlinkBotPlugin;
+use super::feishu_bot::FeishuBotPlugin;
 use super::types::{
     ChannelPlugin, PluginInfo, PluginRuntimeCtx, PluginState, PluginStatusSnapshot,
 };
@@ -39,6 +40,8 @@ impl PluginManager {
         let mut plugins: HashMap<String, Arc<dyn ChannelPlugin>> = HashMap::new();
         let ilink = Arc::new(IlinkBotPlugin::new());
         plugins.insert(ilink.descriptor().id.to_string(), ilink);
+        let feishu = Arc::new(FeishuBotPlugin::new());
+        plugins.insert(feishu.descriptor().id.to_string(), feishu);
 
         let mut states = HashMap::new();
         for id in plugins.keys() {
@@ -269,10 +272,11 @@ impl PluginManager {
     pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), AppError> {
         let _ = self.plugin(id)?;
         let app_state = self.app.state::<AppState>();
-        let key = if id == "ilinkbot" {
-            "plugin.ilinkbot.enabled"
-        } else {
-            return Err(AppError::validation("unsupported plugin"));
+        // 各通道插件统一用 plugin.<id>.enabled 保存开关
+        let key = match id {
+            "ilinkbot" => "plugin.ilinkbot.enabled",
+            "feishubot" => "plugin.feishubot.enabled",
+            _ => return Err(AppError::validation("unsupported plugin")),
         };
         app_state
             .database
@@ -473,11 +477,12 @@ impl PluginManager {
         };
         for info in list {
             if info.bound {
+                // 各通道插件统一用 plugin.<id>.enabled 保存开关
                 let setting = self
                     .app
                     .state::<AppState>()
                     .database
-                    .get_setting("plugin.ilinkbot.enabled")
+                    .get_setting(&format!("plugin.{}.enabled", info.id))
                     .ok()
                     .flatten();
                 if matches!(setting.as_deref(), Some("false" | "0")) {
@@ -490,7 +495,7 @@ impl PluginManager {
                         .app
                         .state::<AppState>()
                         .database
-                        .save_setting("plugin.ilinkbot.enabled", "true");
+                        .save_setting(&format!("plugin.{}.enabled", info.id), "true");
                 }
                 if let Err(e) = self.start(&info.id).await {
                     tracing::warn!("[plugins] auto-start {} failed: {}", info.id, e);

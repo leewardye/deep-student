@@ -3125,6 +3125,12 @@
     "binding_hint": "使用微信扫描二维码，确认后即可将此设备绑定为 ClawBot。",
     "scan_qr": "扫码绑定",
     "cancel_scan": "取消扫码",
+    "feishu_creds_hint": "在飞书开放平台创建「企业自建应用」，开通 im:message 读写与 im:resource 权限，事件订阅选择「使用长连接接收」，并发布版本。填写后启动插件，首条私聊消息将自动绑定发送者。",
+    "feishu_app_id": "App ID",
+    "feishu_app_secret": "App Secret",
+    "feishu_save_creds": "保存凭证",
+    "feishu_edit_creds": "重新配置凭证",
+    "feishu_bind_hint": "已就绪。在飞书里给机器人发一条私聊消息即可完成绑定。",
     "qr_loading": "正在生成二维码…",
     "qr_status": {
       "wait": "请使用微信扫描二维码",

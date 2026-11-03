@@ -72,6 +72,7 @@ export const IlinkBotConfigPanel: React.FC<IlinkBotConfigPanelProps> = ({
   const [busy, setBusy] = useState(false);
   const [unbindOpen, setUnbindOpen] = useState(false);
   const [activityLog, setActivityLog] = useState<string[]>([]);
+  const [showFeishuCreds, setShowFeishuCreds] = useState(false);
 
   const refreshConfig = useCallback(async () => {
     try {
@@ -231,7 +232,7 @@ export const IlinkBotConfigPanel: React.FC<IlinkBotConfigPanelProps> = ({
           title={t('settings:plugins.connection_title')}
           actions={<Badge variant={stateBadgeVariant(currentState)}>{stateLabel}</Badge>}
         >
-          {!bound && !waitingLogin && (
+          {plugin.id !== 'feishubot' && !bound && !waitingLogin && (
             <div className="space-y-3 px-1 py-2.5">
               <p className="text-xs leading-relaxed text-muted-foreground/70">
                 {t('settings:plugins.binding_hint')}
@@ -256,6 +257,31 @@ export const IlinkBotConfigPanel: React.FC<IlinkBotConfigPanelProps> = ({
                 <QrCode className="w-4 h-4 mr-1" />
                 {t('settings:plugins.scan_qr')}
               </DsButton>
+            </div>
+          )}
+
+          {/* 飞书：凭证表单（无扫码流程；已保存后可经「重新配置凭证」再编辑） */}
+          {plugin.id === 'feishubot' && (!bound || showFeishuCreds) && (
+            <div className="space-y-3 px-1 py-2.5">
+              <p className="text-xs leading-relaxed text-muted-foreground/70">
+                {t('settings:plugins.feishu_creds_hint')}
+              </p>
+              <FeishuCredsForm
+                initialAppId={config.appId || ''}
+                hasSecret={Boolean(config.hasSecret)}
+                busy={busy}
+                onSave={async (appId, appSecret) => {
+                  setBusy(true);
+                  try {
+                    await saveConfig({ appId, appSecret });
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              />
+              <p className="text-xs leading-relaxed text-muted-foreground/70">
+                {t('settings:plugins.feishu_bind_hint')}
+              </p>
             </div>
           )}
 
@@ -328,6 +354,20 @@ export const IlinkBotConfigPanel: React.FC<IlinkBotConfigPanelProps> = ({
                     onClick={() => void toggleEnabled(true)}
                   >
                     {t('settings:plugins.reconnect')}
+                  </DsButton>
+                </div>
+              )}
+              {plugin.id === 'feishubot' && (
+                <div className="px-1 py-2.5">
+                  <DsButton
+                    size="sm"
+                    variant="outline"
+                    disabled={busy}
+                    onClick={() => setShowFeishuCreds((v) => !v)}
+                  >
+                    {showFeishuCreds
+                      ? t('settings:plugins.back_to_list')
+                      : t('settings:plugins.feishu_edit_creds')}
                   </DsButton>
                 </div>
               )}
@@ -656,3 +696,50 @@ export const PluginsTab: React.FC<PluginsTabProps> = ({ models }) => {
     </div>
   );
 };
+
+/** 飞书凭证表单：App ID / App Secret（secure store 由后端 set_config 落盘） */
+function FeishuCredsForm(props: {
+  initialAppId: string;
+  hasSecret: boolean;
+  busy: boolean;
+  onSave: (appId: string, appSecret: string) => Promise<void>;
+}) {
+  const { t } = useTranslation(['settings']);
+  const [appId, setAppId] = useState(props.initialAppId);
+  const [appSecret, setAppSecret] = useState('');
+  const dirty = appSecret.length > 0;
+  return (
+    <div className="space-y-2">
+      <Input
+        className="bg-transparent [@media(pointer:coarse)]:min-h-11"
+        placeholder={t('settings:plugins.feishu_app_id')}
+        value={appId}
+        onChange={(e) => setAppId(e.target.value.trim())}
+        autoComplete="off"
+        spellCheck={false}
+      />
+      <Input
+        className="bg-transparent [@media(pointer:coarse)]:min-h-11"
+        type="password"
+        placeholder={
+          props.hasSecret
+            ? `${t('settings:plugins.feishu_app_secret')} (••••••)`
+            : t('settings:plugins.feishu_app_secret')
+        }
+        value={appSecret}
+        onChange={(e) => setAppSecret(e.target.value.trim())}
+        autoComplete="new-password"
+        spellCheck={false}
+      />
+      <DsButton
+        size="sm"
+        variant="primary"
+        className="[@media(pointer:coarse)]:!min-h-11"
+        disabled={props.busy || appId.length === 0 || (!dirty && !props.hasSecret)}
+        onClick={() => void props.onSave(appId, appSecret)}
+      >
+        {t('settings:plugins.feishu_save_creds')}
+      </DsButton>
+    </div>
+  );
+}

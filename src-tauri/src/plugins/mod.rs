@@ -2,7 +2,10 @@
 
 pub mod commands;
 pub mod events;
+pub mod feishu_bot;
 pub mod ilink_bot;
+pub mod im_core;
+pub mod im_media;
 pub mod manager;
 pub mod types;
 

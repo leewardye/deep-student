@@ -3125,6 +3125,12 @@
     "binding_hint": "Scan the QR code with WeChat and confirm to bind this device as a ClawBot.",
     "scan_qr": "Scan to bind",
     "cancel_scan": "Cancel scan",
+    "feishu_creds_hint": "Create an enterprise self-built app on Feishu Open Platform, enable im:message (read/write) and im:resource scopes, choose \"Receive events via long connection\" for event subscription, then publish a version. After saving, start the plugin — the first direct message automatically binds the sender.",
+    "feishu_app_id": "App ID",
+    "feishu_app_secret": "App Secret",
+    "feishu_save_creds": "Save credentials",
+    "feishu_edit_creds": "Edit credentials",
+    "feishu_bind_hint": "Ready. Send the bot a direct message on Feishu to finish binding.",
     "qr_loading": "Generating QR code…",
     "qr_status": {
       "wait": "Scan the QR code with WeChat",

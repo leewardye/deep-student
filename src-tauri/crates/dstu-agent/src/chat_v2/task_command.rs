@@ -39,6 +39,8 @@ use super::state::ChatV2State;
 
 /// iLink 微信渠道的 channel 标识
 pub const CHANNEL_ILINK_WECHAT: &str = "ilink-wechat";
+/// 飞书自建应用机器人通道（plugins::feishu_bot）
+pub const CHANNEL_FEISHU: &str = "feishu";
 
 /// 任务注册表容量上限（超出后淘汰最旧的已结束任务）
 const MAX_TASKS: usize = 500;
