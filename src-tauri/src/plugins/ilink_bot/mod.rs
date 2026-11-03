@@ -22,6 +22,8 @@ use crate::chat_v2::task_command::{self, RemoteTaskManager};
 use crate::database::Database;
 use crate::models::AppError;
 use crate::plugins::events;
+use crate::plugins::im_core::{attachment_manifest, ImChannel, IngestedAttachment};
+use crate::plugins::im_media;
 use crate::plugins::manager::PluginManager;
 use crate::plugins::types::{
     ChannelPlugin, PluginDescriptor, PluginKind, PluginRuntimeCtx, PluginState,
@@ -29,8 +31,8 @@ use crate::plugins::types::{
 };
 
 use client::{
-    extract_text, is_api_error, is_session_expired, IlinkClient, IlinkCredentials,
-    DEFAULT_LONG_POLL_TIMEOUT_MS,
+    extract_media_items, extract_text, is_api_error, is_session_expired, media_kind,
+    probe_media_url, IlinkClient, IlinkCredentials, DEFAULT_LONG_POLL_TIMEOUT_MS,
 };
 use guard::{is_bound_user, RateLimiter};
 
@@ -399,12 +401,87 @@ impl IlinkBotPlugin {
                                     let _ = Self::save_credentials(&ctx.database, &creds);
                                 }
                                 let text = extract_text(&msg);
-                                if text.trim().is_empty() {
+                                let media_items = extract_media_items(&msg);
+                                if text.trim().is_empty() && media_items.is_empty() {
                                     continue;
                                 }
                                 if !is_bound_user(&creds.user_id, &peer) {
                                     self.set_activity("已忽略非绑定用户消息");
                                     events::emit_activity(&ctx.app, PLUGIN_ID, "warn", "非绑定用户消息已忽略");
+                                    continue;
+                                }
+
+                                // —— P1：媒体消息接入统一附件管线 ——
+                                // ClawBot 媒体字段未文档化：能探测到 URL 就下载落盘，
+                                // 探测不到则提示用户并打 debug 日志（协议 spike 线索）。
+                                let mut ingested: Vec<IngestedAttachment> = Vec::new();
+                                let mut media_notes: Vec<String> = Vec::new();
+                                for (i, item) in media_items.iter().enumerate() {
+                                    match probe_media_url(item) {
+                                        Some(url) => match self.client.download_media(&url).await {
+                                            Ok(bytes) => {
+                                                let im_msg_id = msg
+                                                    .message_id
+                                                    .map(|id| format!("m{}", id))
+                                                    .unwrap_or_else(|| {
+                                                        format!("t{}", chrono::Utc::now().timestamp_millis())
+                                                    });
+                                                match im_media::ingest(
+                                                    &ctx.app,
+                                                    ImChannel::WechatIlink,
+                                                    &im_msg_id,
+                                                    i,
+                                                    None,
+                                                    media_kind(item),
+                                                    &bytes,
+                                                ) {
+                                                    Ok(a) => ingested.push(a),
+                                                    Err(e) => media_notes
+                                                        .push(format!("附件 {} 入库失败: {}", i + 1, e)),
+                                                }
+                                            }
+                                            Err(e) => {
+                                                media_notes.push(format!("附件 {} 下载失败: {}", i + 1, e))
+                                            }
+                                        },
+                                        None => {
+                                            tracing::debug!(
+                                                "[ilinkbot] 未识别的媒体 item（协议 spike 线索）: {:?}",
+                                                item
+                                            );
+                                            media_notes.push(
+                                                "已收到图片/文件消息，微信通道暂不支持媒体下载（待协议适配）"
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                                let mut full_text = format!("{}{}", text, attachment_manifest(&ingested));
+                                if !media_notes.is_empty() {
+                                    if !full_text.trim().is_empty() {
+                                        full_text.push('\n');
+                                    }
+                                    full_text.push_str(&media_notes.join("\n"));
+                                }
+                                if full_text.trim().is_empty() {
+                                    // 纯媒体消息且全部下载/识别失败：给用户一次性提示后丢弃
+                                    let ctx_token = creds
+                                        .context_tokens
+                                        .get(&peer)
+                                        .cloned()
+                                        .or_else(|| msg.context_token.clone())
+                                        .unwrap_or_default();
+                                    if !ctx_token.is_empty() {
+                                        let _ = self
+                                            .send_reply(
+                                                &ctx,
+                                                &creds,
+                                                &peer,
+                                                &ctx_token,
+                                                &media_notes.join("\n"),
+                                            )
+                                            .await;
+                                    }
                                     continue;
                                 }
                                 let is_control_message = matches!(
@@ -424,7 +501,10 @@ impl IlinkBotPlugin {
                                     continue;
                                 }
 
-                                let summary = format!("收到消息: {}", text.chars().take(40).collect::<String>());
+                                let summary = format!(
+                                    "收到消息: {}",
+                                    full_text.chars().take(40).collect::<String>()
+                                );
                                 self.set_activity(&summary);
                                 events::emit_activity(&ctx.app, PLUGIN_ID, "msg_in", &summary);
 
@@ -469,7 +549,7 @@ impl IlinkBotPlugin {
                                 let outcome = self.tasks.dispatch(task_command::InboundRemote {
                                     binding,
                                     message_id: dedup_key,
-                                    text: text.clone(),
+                                    text: full_text.clone(),
                                 });
 
                                 match outcome {

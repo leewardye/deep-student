@@ -75,6 +75,10 @@ pub struct MessageItem {
     #[serde(rename = "type")]
     pub item_type: Option<i32>,
     pub text_item: Option<TextItem>,
+    /// ClawBot 协议未公开文档化：图片/文件等非文本 item 的字段名未知。
+    /// flatten 捕获所有未知字段，供媒体探测使用（而非静默丢弃）。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -101,6 +105,59 @@ pub fn extract_text(msg: &WeixinMessage) -> String {
         .filter_map(|item| item.text_item.as_ref().and_then(|t| t.text.clone()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 提取非文本 item（图片/文件等）。
+pub fn extract_media_items(msg: &WeixinMessage) -> Vec<&MessageItem> {
+    msg.item_list
+        .iter()
+        .filter(|item| item.text_item.is_none())
+        .collect()
+}
+
+/// 在未知结构的媒体 item 里尽力探测可下载 URL。
+/// ClawBot 媒体字段名未文档化，这里按常见命名广撒网；找不到返回 None
+/// （此时调用方应提示用户媒体消息已收到但暂不支持下载，同时打 debug 日志
+/// 供协议 spike 抓包比对）。
+pub fn probe_media_url(item: &MessageItem) -> Option<String> {
+    // 直接字段
+    const URL_KEYS: &[&str] = &["url", "cdn_url", "download_url", "file_url", "pic_url"];
+    for key in URL_KEYS {
+        if let Some(u) = item
+            .extra
+            .get(*key)
+            .and_then(Value::as_str)
+            .filter(|s| s.starts_with("http"))
+        {
+            return Some(u.to_string());
+        }
+    }
+    // 嵌套对象（pic_item / media_item / image_item / file_item 等）
+    const NESTED_KEYS: &[&str] = &[
+        "pic_item", "image_item", "media_item", "file_item", "video_item",
+    ];
+    for key in NESTED_KEYS {
+        if let Some(obj) = item.extra.get(*key).and_then(Value::as_object) {
+            for key in URL_KEYS {
+                if let Some(u) = obj
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .filter(|s| s.starts_with("http"))
+                {
+                    return Some(u.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// item 是否疑似图片类型。type 编号未文档化：type==1 已知是文本，
+/// 其余按「非文本即媒体」处理，具体分类留给协议 spike。
+pub fn media_kind(item: &MessageItem) -> crate::plugins::im_core::AttachKind {
+    // 目前只有文本(type 1)已知；图片/文件分类无法区分时一律按图片处理
+    // （学生场景绝大多数是拍照错题），文件类会以后缀名修正。
+    crate::plugins::im_core::AttachKind::Image
 }
 
 /// Split long outbound text into chunks (<= limit runes approx by chars).
@@ -271,6 +328,28 @@ impl IlinkClient {
         }
     }
 
+    /// 下载消息里的媒体（媒体 URL 由 probe_media_url 探测）。
+    pub async fn download_media(&self, url: &str) -> Result<Vec<u8>, AppError> {
+        let resp = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| AppError::network(format!("媒体下载失败: {}", e)))?;
+        if !resp.status().is_success() {
+            return Err(AppError::network(format!(
+                "媒体下载 HTTP {}",
+                resp.status()
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| AppError::network(format!("媒体读取失败: {}", e)))?;
+        Ok(bytes.to_vec())
+    }
+
     pub async fn send_text(
         &self,
         creds: &IlinkCredentials,
@@ -404,5 +483,44 @@ mod tests {
         let chunks = chunk_text(text, 3);
         assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 3));
         assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn unknown_media_items_are_captured_not_dropped() {
+        let raw = json!({
+            "seq": 7,
+            "from_user_id": "peer-1",
+            "item_list": [
+                { "type": 1, "text_item": { "text": "帮我看看这道题" } },
+                { "type": 3, "pic_item": { "cdn_url": "https://cdn.example.com/pic.jpg", "aeskey": "k" } },
+                { "type": 4, "file_item": { "url": "https://cdn.example.com/hw.pdf" } }
+            ]
+        });
+        let msg: WeixinMessage = serde_json::from_value(raw).expect("parse");
+        assert_eq!(msg.item_list.len(), 3, "flatten 必须保留未知 item");
+        let media = extract_media_items(&msg);
+        assert_eq!(media.len(), 2);
+        let u1 = probe_media_url(media[0]).expect("nested pic_item cdn_url");
+        assert_eq!(u1, "https://cdn.example.com/pic.jpg");
+        let u2 = probe_media_url(media[1]).expect("nested file_item url");
+        assert_eq!(u2, "https://cdn.example.com/hw.pdf");
+    }
+
+    #[test]
+    fn probe_media_url_handles_direct_and_missing() {
+        let direct: MessageItem = serde_json::from_value(json!({
+            "type": 5, "url": "https://x.example.com/a.png"
+        }))
+        .expect("parse");
+        assert_eq!(
+            probe_media_url(&direct).as_deref(),
+            Some("https://x.example.com/a.png")
+        );
+        let none: MessageItem =
+            serde_json::from_value(json!({ "type": 6, "some_blob": "opaque" })).expect("parse");
+        assert!(probe_media_url(&none).is_none(), "无 URL 字段返回 None");
+        let not_http: MessageItem =
+            serde_json::from_value(json!({ "type": 7, "url": "wxfile://local" })).expect("parse");
+        assert!(probe_media_url(&not_http).is_none(), "非 http URL 不采纳");
     }
 }
