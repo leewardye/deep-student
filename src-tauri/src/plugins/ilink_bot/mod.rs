@@ -446,6 +446,9 @@ impl IlinkBotPlugin {
                                                         resolved.filename.as_deref(),
                                                         resolved.kind,
                                                         &bytes,
+                                                        &im_media::extra_allowed_extensions(
+                                                            &ctx.database,
+                                                        ),
                                                     ) {
                                                         Ok(mut a) => {
                                                             im_media::register_vfs(&ctx.app, &mut a);
@@ -910,6 +913,11 @@ impl ChannelPlugin for IlinkBotPlugin {
             Self::read_setting(database, "plugin.ilinkbot.model_config_id").unwrap_or_default();
         let system_prompt =
             Self::read_setting(database, "plugin.ilinkbot.system_prompt").unwrap_or_default();
+        let extra_ext = database
+            .get_setting(crate::plugins::im_media::EXTRA_EXT_SETTING_KEY)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let enabled = Self::read_setting(database, "plugin.ilinkbot.enabled")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -920,6 +928,7 @@ impl ChannelPlugin for IlinkBotPlugin {
             "rateLimitPerMin": rate,
             "modelConfigId": model,
             "systemPrompt": system_prompt,
+            "extraExt": extra_ext,
             "bound": bound,
             "hasToken": bound,
             "accountId": creds.as_ref().map(|c| c.account_id.clone()).unwrap_or_default(),
@@ -947,6 +956,11 @@ impl ChannelPlugin for IlinkBotPlugin {
         if let Some(s) = patch.get("systemPrompt").and_then(|x| x.as_str()) {
             database
                 .save_setting("plugin.ilinkbot.system_prompt", s)
+                .map_err(|e| AppError::database(e.to_string()))?;
+        }
+        if let Some(s) = patch.get("extraExt").and_then(|x| x.as_str()) {
+            database
+                .save_setting(crate::plugins::im_media::EXTRA_EXT_SETTING_KEY, s)
                 .map_err(|e| AppError::database(e.to_string()))?;
         }
         // Never accept token via patch from frontend

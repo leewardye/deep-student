@@ -321,6 +321,7 @@ impl FeishuBotPlugin {
                         ext_hint,
                         att.kind,
                         &bytes,
+                        &im_media::extra_allowed_extensions(&ctx.database),
                     ) {
                         Ok(mut item) => {
                             im_media::register_vfs(&ctx.app, &mut item);
@@ -374,15 +375,37 @@ impl FeishuBotPlugin {
                     ev = bridge::read_event(&mut reader) => ev,
                 };
                 match event {
-                    Ok(Some(ev)) => {
-                        if ev.name == "im.message.receive_v1" {
-                            if let Some(inbound) = Self::normalize_event(&ev.data) {
+                    Ok(Some(ev)) => match ev.name.as_str() {
+                        "bridge.error" => {
+                            // 桥进程/SDK 错误必须让用户看得见（常见：appId 无效、
+                            // 无事件订阅权限、长连接被踢等）
+                            let msg = ev.data.as_str().unwrap_or("未知错误");
+                            let out = format!("飞书桥错误: {}", msg);
+                            tracing::warn!("[feishubot] {}", out);
+                            self.set_activity(&out);
+                            events::emit_activity(&ctx.app, PLUGIN_ID, "error", &out);
+                        }
+                        "bridge.log" => {
+                            tracing::info!("[feishubot][bridge] {}", ev.data.as_str().unwrap_or(""));
+                        }
+                        "im.message.receive_v1" => match Self::normalize_event(&ev.data) {
+                            Some(inbound) => {
                                 self.handle_inbound(&ctx, &creds, &rate, &task_slots, inbound)
                                     .await;
                             }
-                        }
-                    }
-                    Ok(None) => { /* 诊断行或空行，继续 */ }
+                            None => {
+                                // 事件被跳过时说明原因（群聊/不支持类型/解析失败），
+                                // 否则用户无法区分「没收到」和「收到但忽略了」
+                                if let Some(reason) = explain_skipped_event(&ev.data) {
+                                    tracing::info!("[feishubot] {}", reason);
+                                    self.set_activity(&reason);
+                                    events::emit_activity(&ctx.app, PLUGIN_ID, "warn", &reason);
+                                }
+                            }
+                        },
+                        _ => {}
+                    },
+                    Ok(None) => { /* 空行，继续 */ }
                     Err(e) => {
                         tracing::warn!("[feishubot] bridge read error: {}", e);
                         self.set_activity(&format!("连接异常: {}", e));
@@ -395,6 +418,9 @@ impl FeishuBotPlugin {
             let delay = Duration::from_secs(
                 (2u64.saturating_pow(reconnect_failures.min(5))).min(MAX_RECONNECT_DELAY_SECS),
             );
+            let out = format!("连接断开，{} 秒后重连（第 {} 次）", delay.as_secs(), reconnect_failures);
+            self.set_activity(&out);
+            events::emit_activity(&ctx.app, PLUGIN_ID, "warn", &out);
             tracing::info!("[feishubot] reconnecting in {:?}...", delay);
             tokio::select! {
                 _ = ctx.cancel.cancelled() => return,
@@ -636,6 +662,34 @@ impl FeishuBotPlugin {
     }
 }
 
+/// 归纳 `im.message.receive_v1` 事件被跳过的原因（供活动日志展示）。
+/// 返回 None 表示不是消息事件（如卡片回调），不打扰用户。
+fn explain_skipped_event(event: &Value) -> Option<String> {
+    let message = event.get("message")?;
+    let chat_type = message
+        .get("chat_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if chat_type == "group" {
+        return Some("收到群聊消息：当前仅支持私聊机器人，请直接私聊发消息".to_string());
+    }
+    if event
+        .pointer("/sender/sender_id/open_id")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
+        return Some("收到消息事件但缺少发送者信息，已忽略".to_string());
+    }
+    let msg_type = message
+        .get("message_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    Some(format!(
+        "收到暂不支持的消息类型「{}」（支持：文字/图片/文件/音频/视频/富文本）",
+        msg_type
+    ))
+}
+
 /// 去掉飞书文本中的 @ 占位符（@_user_1）
 fn strip_mentions(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -835,6 +889,7 @@ impl ChannelPlugin for FeishuBotPlugin {
             "rateLimitPerMin": Self::read_rate_limit(database),
             "modelConfigId": Self::read_setting(database, &format!("{}model_config_id", SETTINGS_PREFIX)).unwrap_or_default(),
             "systemPrompt": Self::read_setting(database, &format!("{}system_prompt", SETTINGS_PREFIX)).unwrap_or_default(),
+            "extraExt": Self::read_setting(database, crate::plugins::im_media::EXTRA_EXT_SETTING_KEY).unwrap_or_default(),
             "appId": creds.as_ref().map(|c| c.app_id.clone()).unwrap_or_default(),
             "hasSecret": creds.as_ref().map(|c| !c.app_secret.is_empty()).unwrap_or(false),
             "configured": configured,
@@ -868,6 +923,11 @@ impl ChannelPlugin for FeishuBotPlugin {
         if let Some(s) = patch.get("systemPrompt").and_then(|x| x.as_str()) {
             database
                 .save_setting(&format!("{}system_prompt", SETTINGS_PREFIX), s)
+                .map_err(|e| AppError::database(e.to_string()))?;
+        }
+        if let Some(s) = patch.get("extraExt").and_then(|x| x.as_str()) {
+            database
+                .save_setting(crate::plugins::im_media::EXTRA_EXT_SETTING_KEY, s)
                 .map_err(|e| AppError::database(e.to_string()))?;
         }
         // 凭证写入：appId / appSecret 均可经设置页更新（secure store）。

@@ -455,6 +455,21 @@ export const IlinkBotConfigPanel: React.FC<IlinkBotConfigPanelProps> = ({
               placeholder={t('settings:plugins.system_prompt_placeholder')}
             />
           </div>
+
+          <SettingRow
+            title={t('settings:plugins.attachment_ext')}
+            description={t('settings:plugins.attachment_ext_desc')}
+          >
+            <Input
+              className="w-full bg-transparent md:!w-[280px] [@media(pointer:coarse)]:min-h-11"
+              value={config.extraExt ?? ''}
+              onChange={(e) =>
+                setConfig((c) => (c ? { ...c, extraExt: e.target.value } : c))
+              }
+              onBlur={() => void saveConfig({ extraExt: config.extraExt ?? '' })}
+              placeholder={t('settings:plugins.attachment_ext_placeholder')}
+            />
+          </SettingRow>
         </SettingsGroup>
 
         {/* 错误与最近活动 */}

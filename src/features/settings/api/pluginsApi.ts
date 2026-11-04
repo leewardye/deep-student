@@ -39,6 +39,8 @@ export interface IlinkBotConfig {
   rateLimitPerMin: number;
   modelConfigId: string;
   systemPrompt: string;
+  /** 附件白名单补充扩展名（逗号分隔；两个 IM 通道共用，get_public_config 返回） */
+  extraExt?: string;
   bound: boolean;
   hasToken: boolean;
   accountId: string;

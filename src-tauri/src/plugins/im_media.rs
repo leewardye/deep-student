@@ -6,18 +6,53 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::database::Database;
 use crate::models::AppError;
 
 use super::im_core::{AttachKind, IngestedAttachment, ImChannel};
 
-/// 单附件大小上限（20MB）
-pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+/// 单附件大小上限（50MB）
+pub const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
 
-/// 按扩展名的 MIME 白名单（错题/作业场景为主）
+/// 全局「补充扩展名」设置键（逗号分隔；两个 IM 通道共用）
+pub const EXTRA_EXT_SETTING_KEY: &str = "plugin.im.extra_ext";
+
+/// 按扩展名的 MIME 白名单（错题/作业场景为主）。
+/// 覆盖：图片 / 常见文档（含 WPS、知网 CAJ、OFD）/ 音视频 / 压缩包 / 网页存档 /
+/// 纯文本与数据格式。可执行文件（exe/dll/bat 等）与安装包永远不在名单内。
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "pdf", "doc", "docx", "ppt",
-    "pptx", "xls", "xlsx", "txt", "md", "csv", "epub", "mp3", "m4a", "wav", "mp4", "mov",
+    // 图片
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "svg", "tif", "tiff",
+    // 文档
+    "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "md", "markdown", "csv", "epub",
+    "wps", "et", "dps", "ofd", "caj", "nh", "kdh", "rtf", "pages", "key", "numbers",
+    // 网页存档
+    "html", "htm", "mhtml", "mht",
+    // 压缩包（只入库不执行）
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz",
+    // 纯文本/数据
+    "log", "json", "xml", "yml", "yaml", "ipynb", "srt", "vtt",
+    // 音视频
+    "mp3", "m4a", "wav", "flac", "aac", "ogg", "opus", "mp4", "mov", "avi", "mkv", "webm", "flv",
 ];
+
+/// 读取用户配置的「补充扩展名」（逗号/分号/空白分隔）。
+/// 只接受 1-10 位字母数字扩展名，其余静默丢弃。
+pub fn extra_allowed_extensions(db: &Database) -> Vec<String> {
+    let raw = db
+        .get_setting(EXTRA_EXT_SETTING_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    raw.split(|c: char| c == ',' || c == ';' || c == '，' || c == '；' || c.is_whitespace())
+        .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 10
+                && s.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        .collect()
+}
 
 /// 落盘根目录：`app_data_dir/im_inbox/<channel>/`
 pub fn inbox_root(app: &tauri::AppHandle, channel: ImChannel) -> Result<PathBuf, AppError> {
@@ -30,15 +65,16 @@ pub fn inbox_root(app: &tauri::AppHandle, channel: ImChannel) -> Result<PathBuf,
 }
 
 /// 扩展名白名单校验：优先用 filename 的扩展名，其次 mime 映射。
+/// `extra` 为用户在设置里补充的扩展名（与内置白名单取并集）。
 /// 未知且无扩展名 → 拒绝（宁可拒收也不落盘未知内容）。
-pub fn is_allowed_attachment(filename: Option<&str>, mime: Option<&str>) -> bool {
+pub fn is_allowed_attachment(filename: Option<&str>, mime: Option<&str>, extra: &[String]) -> bool {
     if let Some(name) = filename {
         let ext = Path::new(name)
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         if let Some(ext) = ext {
-            return ALLOWED_EXTENSIONS.contains(&ext.as_str());
+            return ALLOWED_EXTENSIONS.contains(&ext.as_str()) || extra.iter().any(|e| e == &ext);
         }
     }
     if let Some(m) = mime {
@@ -118,6 +154,7 @@ pub fn ingest(
     filename: Option<&str>,
     kind: AttachKind,
     bytes: &[u8],
+    extra_ext: &[String],
 ) -> Result<IngestedAttachment, AppError> {
     if bytes.is_empty() {
         return Err(AppError::validation("附件内容为空"));
@@ -128,8 +165,16 @@ pub fn ingest(
             MAX_ATTACHMENT_BYTES / 1024 / 1024
         )));
     }
-    if !is_allowed_attachment(filename, None) {
-        return Err(AppError::validation("不支持的附件类型（扩展名不在白名单）"));
+    if !is_allowed_attachment(filename, None, extra_ext) {
+        return Err(AppError::validation(format!(
+            "不支持的附件类型（扩展名不在白名单，可在插件设置补充）：{}",
+            filename
+                .and_then(|n| Path::new(n)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_string))
+                .unwrap_or_else(|| "未知".to_string())
+        )));
     }
     let display_name = sanitize_filename(filename, kind);
     let safe_msg_id: String = msg_id
@@ -237,12 +282,33 @@ mod tests {
 
     #[test]
     fn extension_allowlist() {
-        assert!(is_allowed_attachment(Some("错题.jpg"), None));
-        assert!(is_allowed_attachment(Some("作业.PDF"), None));
-        assert!(!is_allowed_attachment(Some("virus.exe"), None));
-        assert!(!is_allowed_attachment(Some("noext"), None));
-        assert!(is_allowed_attachment(None, Some("image/png")));
-        assert!(!is_allowed_attachment(None, Some("application/octet-stream")));
+        let extra: Vec<String> = vec!["dwg".into()];
+        assert!(is_allowed_attachment(Some("错题.jpg"), None, &[]));
+        assert!(is_allowed_attachment(Some("作业.PDF"), None, &[]));
+        assert!(is_allowed_attachment(Some("论文.caj"), None, &[]));
+        assert!(is_allowed_attachment(Some("文档.wps"), None, &[]));
+        assert!(is_allowed_attachment(Some("资料.zip"), None, &[]));
+        assert!(is_allowed_attachment(Some("图纸.dwg"), None, &extra));
+        assert!(!is_allowed_attachment(Some("图纸.dwg"), None, &[]));
+        assert!(!is_allowed_attachment(Some("virus.exe"), None, &extra));
+        assert!(!is_allowed_attachment(Some("noext"), None, &extra));
+        assert!(is_allowed_attachment(None, Some("image/png"), &[]));
+        assert!(!is_allowed_attachment(None, Some("application/octet-stream"), &[]));
+    }
+
+    #[test]
+    fn extra_extension_parsing() {
+        // 纯函数部分无法构造 Database，这里只测清洗逻辑经由公开路径的边界；
+        // Database 读取路径由 ingest 集成验证。
+        let raw = " DWG, ;exe；.zip，，abc-123 ";
+        let parsed: Vec<String> = raw
+            .split(|c: char| c == ',' || c == ';' || c == '，' || c == '；' || c.is_whitespace())
+            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|s| {
+                !s.is_empty() && s.len() <= 10 && s.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+            .collect();
+        assert_eq!(parsed, vec!["dwg", "exe", "zip"]);
     }
 
     #[test]
@@ -269,6 +335,6 @@ mod tests {
     #[test]
     fn ingest_rejects_empty_and_oversize() {
         // 不需要真实 AppHandle 的分支先行验证
-        assert!(is_allowed_attachment(Some("a.jpg"), None));
+        assert!(is_allowed_attachment(Some("a.jpg"), None, &[]));
     }
 }

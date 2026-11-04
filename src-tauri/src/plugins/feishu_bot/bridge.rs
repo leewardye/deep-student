@@ -146,9 +146,13 @@ where
         return Ok(None);
     }
     if !line.starts_with('{') {
-        // SDK 日志行：含 error 关键字时留痕，但不触发重连
-        if line.contains("error") {
-            tracing::warn!("[feishubot][bridge] {}", line);
+        // SDK 日志行：含 error 关键字时作为 bridge.error 事件上抛（UI 活动日志可见），
+        // 但不触发重连
+        if line.to_ascii_lowercase().contains("error") {
+            return Ok(Some(BridgeEvent {
+                name: "bridge.error".to_string(),
+                data: serde_json::Value::String(line.to_string()),
+            }));
         }
         return Ok(None);
     }
@@ -159,9 +163,22 @@ where
             return Ok(None);
         }
     };
-    // stderr 类诊断行：{"type":"log"|"error", "message": "..."}
+    // stderr 类诊断行：{"type":"log"|"error", "message": "..."} —— 上抛给插件层
     match v.get("type").and_then(|t| t.as_str()) {
-        Some("log") | Some("error") => Ok(None),
+        Some("log") | Some("error") => {
+            let name = if v.get("type").and_then(|t| t.as_str()) == Some("error") {
+                "bridge.error"
+            } else {
+                "bridge.log"
+            };
+            Ok(Some(BridgeEvent {
+                name: name.to_string(),
+                data: v
+                    .get("message")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            }))
+        }
         _ => Ok(Some(BridgeEvent {
             name: v
                 .get("name")
@@ -193,19 +210,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_event_skips_log_lines() {
+    async fn read_event_surfaces_log_lines() {
         let data = b"{\"type\":\"log\",\"message\":\"connected\"}\n";
         let mut reader = BufReader::new(&data[..]);
-        let ev = read_event(&mut reader).await.unwrap();
-        assert!(ev.is_none());
+        let ev = read_event(&mut reader).await.unwrap().unwrap();
+        assert_eq!(ev.name, "bridge.log");
+        assert_eq!(ev.data, "connected");
+    }
+
+    #[tokio::test]
+    async fn read_event_surfaces_bridge_errors() {
+        let data =
+            b"{\"type\":\"error\",\"message\":\"ws handshake failed\"}\n[error]: [ 'invalid appId' ]\n";
+        let mut reader = BufReader::new(&data[..]);
+        let ev = read_event(&mut reader).await.unwrap().unwrap();
+        assert_eq!(ev.name, "bridge.error");
+        assert_eq!(ev.data, "ws handshake failed");
+        let ev = read_event(&mut reader).await.unwrap().unwrap();
+        assert_eq!(ev.name, "bridge.error");
+        assert!(ev.data.as_str().unwrap().contains("invalid appId"));
     }
 
     #[tokio::test]
     async fn read_event_tolerates_sdk_logger_lines() {
-        // 实测官方 SDK 会往 stdout 打非 JSON 日志，必须跳过而非断线
+        // 实测官方 SDK 会往 stdout 打非 JSON 日志：info 行跳过，error 行上抛为 bridge.error
         let data = b"[info]: [ 'event-dispatch is ready' ]\n[error]: [ '[ws]', 'invalid appId: x' ]\n";
         let mut reader = BufReader::new(&data[..]);
         assert!(read_event(&mut reader).await.unwrap().is_none());
-        assert!(read_event(&mut reader).await.unwrap().is_none());
+        let ev = read_event(&mut reader).await.unwrap().unwrap();
+        assert_eq!(ev.name, "bridge.error");
+        assert!(ev.data.as_str().unwrap().contains("invalid appId"));
     }
 }
