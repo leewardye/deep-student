@@ -1037,6 +1037,37 @@ export const VendorDetailPanel: React.FC<VendorDetailPanelProps> = ({ scrollElem
                 <h3 className="text-base font-semibold text-foreground">{t('settings:vendor_panel.model_list_title')}</h3>
                 <p className="text-sm text-muted-foreground">{t('settings:vendor_panel.model_list_desc', { count: selectedVendorModels.length })}</p>
               </div>
+              {/* 供应商级开关：一键启停该供应商全部模型（不必删 Key） */}
+              {selectedVendorModels.length > 0 && !selectedVendorIsSiliconflow && (
+                (() => {
+                  const allEnabled = selectedVendorModels.every(({ profile }) => profile.enabled);
+                  return (
+                    <label className="flex items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
+                      <Switch
+                        checked={allEnabled}
+                        disabled={vendorBusy || vendorSaving}
+                        onCheckedChange={async (value) => {
+                          const targets = selectedVendorModels.filter(({ profile }) => profile.enabled !== value);
+                          for (const { profile } of targets) {
+                            await handleToggleModelProfile(profile, value);
+                          }
+                          if (targets.length > 0) {
+                            showGlobalNotification(
+                              'success',
+                              value
+                                ? t('settings:vendor_panel.vendor_enabled_all', { count: targets.length })
+                                : t('settings:vendor_panel.vendor_disabled_all', { count: targets.length }),
+                            );
+                          }
+                        }}
+                      />
+                      <span className="cursor-pointer select-none">
+                        {t('settings:vendor_panel.vendor_toggle_label')}
+                      </span>
+                    </label>
+                  );
+                })()
+              )}
               <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:flex-shrink-0">
                 {!isCodexOAuthVendor && onAddVendorModels && supportsModelFetching(selectedVendor.providerType) && (
                   <DsButton

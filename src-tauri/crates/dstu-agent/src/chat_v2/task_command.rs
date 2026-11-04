@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use super::database::ChatV2Database;
 use super::headless::{HeadlessSessionTurn, DEFAULT_HARD_TIMEOUT_SECS};
@@ -41,6 +41,9 @@ use super::state::ChatV2State;
 pub const CHANNEL_ILINK_WECHAT: &str = "ilink-wechat";
 /// 飞书自建应用机器人通道（plugins::feishu_bot）
 pub const CHANNEL_FEISHU: &str = "feishu";
+
+/// 远程任务新建会话后广播给前端的事件（刷新聊天列表）。
+pub const REMOTE_SESSIONS_CHANGED_EVENT: &str = "chat_v2://remote_sessions_changed";
 
 /// 任务注册表容量上限（超出后淘汰最旧的已结束任务）
 const MAX_TASKS: usize = 500;
@@ -938,7 +941,12 @@ pub fn create_remote_task_session(app: &AppHandle, plan: &PlannedTurn) -> Result
         "source": plan.source,
         "remote_binding": serde_json::to_value(&plan.binding).unwrap_or(Value::Null),
     });
-    super::headless::create_headless_session(&db, "automation", &plan.title, metadata)
+    let session_id = super::headless::create_headless_session(&db, "automation", &plan.title, metadata)?;
+    // 通知前端刷新会话列表（IM 创建的会话此前只在重启后才出现在聊天列表）
+    if let Err(e) = app.emit(REMOTE_SESSIONS_CHANGED_EVENT, json!({ "session_id": session_id })) {
+        tracing::warn!("[remote_task] emit remote_sessions_changed failed: {}", e);
+    }
+    Ok(session_id)
 }
 
 /// 由 Launch 计划构建底层 headless turn 请求。

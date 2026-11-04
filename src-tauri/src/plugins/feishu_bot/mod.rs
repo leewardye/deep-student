@@ -279,6 +279,11 @@ impl FeishuBotPlugin {
                 }
                 Err(e) => {
                     tracing::warn!("[feishubot] send failed: {}", e);
+                    // 回复失败必须让用户在 UI 上看得见（常见：平台未给机器人
+                    // im:message 发送权限 / 版本未发布），否则无从排查
+                    let out = format!("回复发送失败: {}", e);
+                    self.set_activity(&out);
+                    events::emit_activity(&ctx.app, PLUGIN_ID, "error", &out);
                     return Err(e);
                 }
             }

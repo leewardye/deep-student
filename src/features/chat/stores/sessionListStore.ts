@@ -1,9 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { create } from 'zustand';
 import { SESSION_LIST_PAGE_SIZE } from '../core/constants';
 import type { SessionGroup } from '../types/group';
 import type { ChatSession } from '../types/session';
 import { getErrorMessage } from '@/utils/errorUtils';
+
+/** 后端（微信/飞书远程任务）新建会话后广播的事件名 */
+const REMOTE_SESSIONS_CHANGED_EVENT = 'chat_v2://remote_sessions_changed';
 
 type StateUpdater<T> = T | ((previous: T) => T);
 
@@ -207,9 +211,16 @@ function installGlobalListeners(): () => void {
   window.addEventListener('chat-v2:sessions-updated', handleMutation);
   window.addEventListener('chat-v2:groups-updated', handleMutation);
   document.addEventListener('visibilitychange', handleVisibilityChange);
+  // IM 远程任务新建会话（微信/飞书）：后端广播 → 防抖刷新列表
+  let unlistenRemote: (() => void) | null = null;
+  void listen(REMOTE_SESSIONS_CHANGED_EVENT, () => handleMutation()).then(
+    (unlisten) => { unlistenRemote = unlisten; },
+    () => { /* 非桌面环境（测试）忽略 */ },
+  );
   return () => {
     if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = null;
+    unlistenRemote?.();
     window.removeEventListener('chat-v2:sessions-updated', handleMutation);
     window.removeEventListener('chat-v2:groups-updated', handleMutation);
     document.removeEventListener('visibilitychange', handleVisibilityChange);

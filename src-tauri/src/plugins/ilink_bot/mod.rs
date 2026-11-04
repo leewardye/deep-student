@@ -32,8 +32,8 @@ use crate::plugins::types::{
 };
 
 use client::{
-    extract_media_items, extract_text, is_api_error, is_session_expired, media_kind,
-    probe_media_url, IlinkClient, IlinkCredentials, DEFAULT_LONG_POLL_TIMEOUT_MS,
+    extract_media_items, extract_text, is_api_error, is_session_expired, resolve_media,
+    IlinkClient, IlinkCredentials, DEFAULT_LONG_POLL_TIMEOUT_MS,
 };
 use guard::{is_bound_user, RateLimiter};
 
@@ -419,41 +419,46 @@ impl IlinkBotPlugin {
                                 }
 
                                 // —— P1：媒体消息接入统一附件管线 ——
-                                // ClawBot 媒体字段未文档化：能探测到 URL 就下载落盘，
-                                // 探测不到则提示用户并打 debug 日志（协议 spike 线索）。
+                                // 官方 openclaw-weixin 协议：CDN 下载 + AES-128-ECB 解密；
+                                // 解析不出下载方式的 item 打 debug 日志留协议 spike 线索。
                                 let mut ingested: Vec<IngestedAttachment> = Vec::new();
                                 let mut media_notes: Vec<String> = Vec::new();
                                 for (i, item) in media_items.iter().enumerate() {
-                                    match probe_media_url(item) {
-                                        Some(url) => match self.client.download_media(&url).await {
-                                            Ok(bytes) => {
-                                                let im_msg_id = msg
-                                                    .message_id
-                                                    .map(|id| format!("m{}", id))
-                                                    .unwrap_or_else(|| {
-                                                        format!("t{}", chrono::Utc::now().timestamp_millis())
-                                                    });
-                                                match im_media::ingest(
-                                                    &ctx.app,
-                                                    ImChannel::WechatIlink,
-                                                    &im_msg_id,
-                                                    i,
-                                                    None,
-                                                    media_kind(item),
-                                                    &bytes,
-                                                ) {
-                                                    Ok(mut a) => {
-                                                        im_media::register_vfs(&ctx.app, &mut a);
-                                                        ingested.push(a);
+                                    match resolve_media(item) {
+                                        Some(resolved) => {
+                                            match self
+                                                .client
+                                                .download_media(&resolved.url, resolved.aes_key.as_deref())
+                                                .await
+                                            {
+                                                Ok(bytes) => {
+                                                    let im_msg_id = msg
+                                                        .message_id
+                                                        .map(|id| format!("m{}", id))
+                                                        .unwrap_or_else(|| {
+                                                            format!("t{}", chrono::Utc::now().timestamp_millis())
+                                                        });
+                                                    match im_media::ingest(
+                                                        &ctx.app,
+                                                        ImChannel::WechatIlink,
+                                                        &im_msg_id,
+                                                        i,
+                                                        resolved.filename.as_deref(),
+                                                        resolved.kind,
+                                                        &bytes,
+                                                    ) {
+                                                        Ok(mut a) => {
+                                                            im_media::register_vfs(&ctx.app, &mut a);
+                                                            ingested.push(a);
+                                                        }
+                                                        Err(e) => media_notes
+                                                            .push(format!("附件 {} 入库失败: {}", i + 1, e)),
                                                     }
-                                                    Err(e) => media_notes
-                                                        .push(format!("附件 {} 入库失败: {}", i + 1, e)),
                                                 }
+                                                Err(e) => media_notes
+                                                    .push(format!("附件 {} 下载失败: {}", i + 1, e)),
                                             }
-                                            Err(e) => {
-                                                media_notes.push(format!("附件 {} 下载失败: {}", i + 1, e))
-                                            }
-                                        },
+                                        }
                                         None => {
                                             tracing::debug!(
                                                 "[ilinkbot] 未识别的媒体 item（协议 spike 线索）: {:?}",
