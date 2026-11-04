@@ -146,6 +146,7 @@ pub use dstu_vfs::pdf_protocol;
 pub use dstu_vision::page_rasterizer;
 pub use dstu_vision::pdf_ocr_service;
 pub mod plugins; // 可插拔通道插件（iLink Bot 等）
+pub mod profiles; // 多用户账套：每账套独立数据根（数据库/文件/凭证隔离）
 pub use dstu_core::prompt_contracts; // 跨链路共享的 LLM 输出契约常量（LaTeX 等，单一来源）
 pub use dstu_llm::providers;
 pub use dstu_qbank::qbank_authoring_service;
@@ -926,13 +927,18 @@ pub fn run() {
             // RUST_BACKTRACE / RUST_LOG 已移至 run() 开头（真正的单线程阶段）。
             // ANTI-REGRESSION：勿在此 set_var WEBVIEW2_* 注入 --disable-gpu*；见 windows conf。
 
+            // 多用户账套：加载（或首次创建）注册表。default 账套直接使用应用数据根
+            // （存量用户零迁移），其余账套数据位于 <app_data>/profiles/<id>/。
+            // 此后所有数据空间/业务库初始化一律以 profile_data_root 为根。
+            let profile_data_root = crate::profiles::load_or_init(&base_app_data_dir);
+
             // 在打开任何业务数据库前扫描数据时间线冲突。可恢复冲突不再让 Tauri
             // setup 失败；后端只注册恢复状态并保持窗口可用，由前端 Recovery Shell
             // 引导用户选择。该分支绝不能继续初始化 AppState/数据治理/后台任务。
             let startup_recovery_state =
-                match crate::data_space::prepare_startup_recovery(&base_app_data_dir) {
+                match crate::data_space::prepare_startup_recovery(&profile_data_root) {
                     Ok(incident) => crate::data_space::StartupRecoveryState::new(
-                        base_app_data_dir.clone(),
+                        profile_data_root.clone(),
                         incident,
                     ),
                     Err(error) => {
@@ -941,7 +947,7 @@ pub fn run() {
                             error
                         );
                         crate::data_space::StartupRecoveryState::failed(
-                            base_app_data_dir.clone(),
+                            profile_data_root.clone(),
                             "startup_preflight",
                             error,
                         )
@@ -960,7 +966,7 @@ pub fn run() {
             }
 
             // 初始化数据空间管理器（A/B 双数据空间）并应用 pending 切换
-            if let Err(e) = crate::data_space::init_data_space_manager(base_app_data_dir.clone()) {
+            if let Err(e) = crate::data_space::init_data_space_manager(profile_data_root.clone()) {
                 error!(
                     "[startup] 数据空间初始化失败，进入可交互恢复模式: {}",
                     e
@@ -1013,7 +1019,7 @@ pub fn run() {
             }
 
             // 在任何数据库初始化之前，执行启动阶段清理（若存在清理标记）
-            if crate::startup_cleanup::should_purge_on_start(&base_app_data_dir) {
+            if crate::startup_cleanup::should_purge_on_start(&profile_data_root) {
                 // 清空后重置同步消费基线（同步状态属 data_governance，由 app 注入）
                 #[cfg(feature = "data_governance")]
                 let reset_sync_baseline: Option<crate::startup_cleanup::ResetSyncBaselineFn> =
@@ -1025,7 +1031,7 @@ pub fn run() {
                 let reset_sync_baseline: Option<crate::startup_cleanup::ResetSyncBaselineFn> =
                     None;
                 match crate::startup_cleanup::purge_all_local_data(
-                    &base_app_data_dir,
+                    &profile_data_root,
                     &active_app_data_dir,
                     reset_sync_baseline,
                 ) {
@@ -1043,7 +1049,7 @@ pub fn run() {
                             return Ok(());
                         }
                         if let Err(e) =
-                            crate::startup_cleanup::clear_purge_marker(&base_app_data_dir)
+                            crate::startup_cleanup::clear_purge_marker(&profile_data_root)
                         {
                             error!("清除清理标记失败，拒绝打开业务库: {}", e);
                             app.state::<crate::data_space::StartupRecoveryState>()
@@ -3179,6 +3185,15 @@ pub fn run() {
             ,crate::plugins::plugin_cancel_login
             ,crate::plugins::plugin_logout
             ,crate::plugins::plugin_unbind
+            ,crate::plugins::feishu_bot::feishu_push_message
+            // =================================================
+            // profiles（多用户账套）
+            // =================================================
+            ,crate::profiles::profile_list
+            ,crate::profiles::profile_create
+            ,crate::profiles::profile_rename
+            ,crate::profiles::profile_delete
+            ,crate::profiles::profile_switch
         ])
         // 注册 pdfstream:// 自定义协议，用于 PDF 流式加载（支持 HTTP Range Request）
         .register_uri_scheme_protocol("pdfstream", |ctx, request| {

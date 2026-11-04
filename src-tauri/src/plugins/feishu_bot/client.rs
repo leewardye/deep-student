@@ -221,6 +221,90 @@ impl FeishuClient {
         self.send_message(creds, chat_id, "image", &content).await
     }
 
+    /// 推断飞书文件上传的 file_type（官方接口只接受这几种枚举值）
+    pub fn file_type_for_path(path: &std::path::Path) -> Result<&'static str, AppError> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let t = match ext.as_str() {
+            "opus" => "opus",
+            "mp4" | "mov" => "mp4",
+            "pdf" => "pdf",
+            "doc" => "doc",
+            "docx" => "docx",
+            "xls" => "xls",
+            "xlsx" => "xlsx",
+            "ppt" => "ppt",
+            "pptx" => "pptx",
+            _ => {
+                return Err(AppError::validation(format!(
+                    "飞书文件消息不支持的类型 .{}（支持 opus/mp4/pdf/doc(x)/xls(x)/ppt(x)）；请改用图片或压缩为 pdf",
+                    ext
+                )))
+            }
+        };
+        Ok(t)
+    }
+
+    /// 上传出站文件，返回 file_key。
+    /// 官方约定：file_type / file_name 是 multipart **表单文本字段**（非查询参数）。
+    pub async fn upload_file(
+        &self,
+        creds: &FeishuCredentials,
+        path: &std::path::Path,
+    ) -> Result<String, AppError> {
+        let file_type = Self::file_type_for_path(path)?;
+        let token = self.tenant_access_token(creds).await?;
+        let url = format!("{}/im/v1/files", self.base_url);
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| AppError::internal(format!("读取文件失败: {}", e)))?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(file_name.clone())
+            .mime_str("application/octet-stream")
+            .map_err(|e| AppError::internal(format!("构造文件分片失败: {}", e)))?;
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", file_type)
+            .text("file_name", file_name)
+            .part("file", part);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| AppError::network(format!("上传文件失败: {}", e)))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::network(format!("解析上传文件响应失败: {}", e)))?;
+        ensure_ok(&body)?;
+        body.pointer("/data/file_key")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| AppError::network("飞书响应缺少 data.file_key"))
+    }
+
+    /// 发送文件（先上传得 file_key）
+    pub async fn send_file(
+        &self,
+        creds: &FeishuCredentials,
+        chat_id: &str,
+        path: &std::path::Path,
+    ) -> Result<(), AppError> {
+        let file_key = self.upload_file(creds, path).await?;
+        let content = serde_json::json!({ "file_key": file_key }).to_string();
+        self.send_message(creds, chat_id, "file", &content).await
+    }
+
     async fn send_message(
         &self,
         creds: &FeishuCredentials,
@@ -285,5 +369,30 @@ mod tests {
         assert!(ensure_ok(&ok).is_ok());
         let err = serde_json::json!({"code": 99991663, "msg": "token invalid"});
         assert!(ensure_ok(&err).is_err());
+    }
+
+    #[test]
+    fn file_type_mapping() {
+        let p = |s: &str| std::path::Path::new(s);
+        assert_eq!(FeishuClient::file_type_for_path(p("a.PDF")).unwrap(), "pdf");
+        assert_eq!(
+            FeishuClient::file_type_for_path(p("笔记.docx")).unwrap(),
+            "docx"
+        );
+        assert_eq!(
+            FeishuClient::file_type_for_path(p("课堂录像.MP4")).unwrap(),
+            "mp4"
+        );
+        assert_eq!(
+            FeishuClient::file_type_for_path(p("听力.opus")).unwrap(),
+            "opus"
+        );
+        assert_eq!(
+            FeishuClient::file_type_for_path(p("slide.pptx")).unwrap(),
+            "pptx"
+        );
+        // 不支持的类型要有可读错误
+        assert!(FeishuClient::file_type_for_path(p("a.zip")).is_err());
+        assert!(FeishuClient::file_type_for_path(p("无扩展名")).is_err());
     }
 }

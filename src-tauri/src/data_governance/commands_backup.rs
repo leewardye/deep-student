@@ -3041,20 +3041,27 @@ async fn execute_tiered_backup_with_progress(
 
 // ==================== 清空数据命令 ====================
 
-/// 清空所有应用数据
+/// 清空当前账套的应用数据
 ///
-/// 写入清理标记并触发应用重启，下次启动时会自动清除 active_app_data_dir 下所有数据。
+/// 写入清理标记（账套级：当前激活账套的数据根）并触发应用重启，
+/// 下次启动时会自动清除当前账套 active_app_data_dir 下所有数据。
+/// 其他账套不受影响。
 #[tauri::command]
 pub fn data_governance_purge_all_data(app: tauri::AppHandle) -> Result<String, String> {
     use crate::startup_cleanup;
 
     let base_dir = get_app_data_dir(&app)?;
+    // 清理标记写到当前激活账套的数据根（启动读取端同一坐标，见 lib.rs）
+    let profile_root = crate::profiles::active_data_root(&base_dir);
 
     // 写入清理标记
-    startup_cleanup::write_purge_marker(&base_dir)
+    startup_cleanup::write_purge_marker(&profile_root)
         .map_err(|e| format!("写入清理标记失败: {}", e))?;
 
-    info!("[data_governance] 已设置清空数据标记，将重启应用执行清理");
+    info!(
+        "[data_governance] 已设置清空数据标记（账套 {}），将重启应用执行清理",
+        profile_root.display()
+    );
 
     // 触发应用重启
     app.restart();

@@ -34,6 +34,7 @@ vi.mock('@phosphor-icons/react', () => {
     Shield: Icon,
     SlidersHorizontal: Icon,
     SquaresFour: Icon,
+    Users: Icon,
     Wrench: Icon,
   };
 });
@@ -42,21 +43,21 @@ import { useSettingsNavigation } from '../useSettingsNavigation';
 
 const EXPECTED_DESKTOP_CATEGORIES = [
   { value: 'ai', tabs: ['apis', 'models', 'params'] },
-  { value: 'experience', tabs: ['general', 'appearance', 'workbench', 'shortcuts'] },
+  { value: 'experience', tabs: ['general', 'appearance', 'workbench', 'shortcuts', 'profiles'] },
   { value: 'personalization', tabs: ['voice-input', 'memory'] },
   { value: 'integrations', tabs: ['mcp', 'search', 'plugins'] },
   { value: 'workflow', tabs: ['automation', 'document-processing'] },
   { value: 'data', tabs: ['statistics', 'data-governance'] },
 ];
 
-const DESKTOP_ONLY_TABS = ['workbench', 'plugins', 'shortcuts'];
+const DESKTOP_ONLY_TABS = ['workbench', 'plugins', 'shortcuts', 'profiles'];
 
 describe('settings category navigation compatibility', () => {
   beforeEach(() => {
     isMobilePlatformMock.mockReturnValue(false);
   });
 
-  it('places all 16 existing settings tabs in exactly one of six categories', () => {
+  it('places all 17 existing settings tabs in exactly one of six categories', () => {
     const { result } = renderHook(() => useSettingsNavigation());
     const categories = result.current.sidebarCategories.map((category) => ({
       value: category.value,
@@ -65,8 +66,8 @@ describe('settings category navigation compatibility', () => {
 
     expect(categories).toEqual(EXPECTED_DESKTOP_CATEGORIES);
     const categorizedTabs = categories.flatMap((category) => category.tabs);
-    expect(categorizedTabs).toHaveLength(16);
-    expect(new Set(categorizedTabs).size).toBe(16);
+    expect(categorizedTabs).toHaveLength(17);
+    expect(new Set(categorizedTabs).size).toBe(17);
     expect([...categorizedTabs].sort()).toEqual(
       result.current.sidebarNavItems
         .filter((item) => item.value !== 'about')
@@ -98,7 +99,7 @@ describe('settings category navigation compatibility', () => {
       expect(searchTabs).toContain(tab);
       expect(categoryTabs).toContain(tab);
     }
-    expect(navTabs).toHaveLength(17);
+    expect(navTabs).toHaveLength(18);
   });
 
   it.each([

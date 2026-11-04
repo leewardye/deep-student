@@ -17,6 +17,7 @@ import {
   Shield,
   SlidersHorizontal,
   SquaresFour,
+  Users,
   Wrench,
 } from '@phosphor-icons/react';
 import { isMobilePlatform } from '@/utils/platform';
@@ -76,6 +77,8 @@ export function useSettingsNavigation() {
 
   const isMobile = isMobilePlatform();
   const hidePlugins = isMobile;
+  // 账套管理为桌面端专属（切换即重启应用；移动端单用户形态）
+  const hideProfiles = isMobile;
   // Mobile platforms have no physical keyboard, so keep shortcut settings out of the mobile navigation.
   const hideShortcuts = isMobile;
   // 学习桌面（Workbench）为桌面端专属（App.tsx workbenchActive 的平台护栏）：
@@ -148,6 +151,17 @@ export function useSettingsNavigation() {
         mobileDescription: t('settings:mobile_descriptions.automation'),
         mobileAccent: SETTINGS_NAV_ACCENT.orange,
       },
+      ...(!hideProfiles
+        ? [
+            {
+              value: 'profiles',
+              icon: Users,
+              label: t('settings:tabs.profiles'),
+              mobileDescription: t('settings:mobile_descriptions.profiles'),
+              mobileAccent: SETTINGS_NAV_ACCENT.teal,
+            },
+          ]
+        : []),
     ],
     [
       {
@@ -222,7 +236,7 @@ export function useSettingsNavigation() {
         mobileAccent: SETTINGS_NAV_ACCENT.pink,
       },
     ],
-  ]), [t, hidePlugins, hideShortcuts, hideWorkbench]);
+  ]), [t, hidePlugins, hideShortcuts, hideWorkbench, hideProfiles]);
 
   const sidebarNavItems = useMemo(() => sidebarNavGroups.flat(), [sidebarNavGroups]);
 
@@ -243,7 +257,7 @@ export function useSettingsNavigation() {
         value: 'experience',
         label: t('settings:categories.experience'),
         icon: SlidersHorizontal,
-        items: pick(['general', 'appearance', 'workbench', 'shortcuts']),
+        items: pick(['general', 'appearance', 'workbench', 'shortcuts', 'profiles']),
       },
       {
         value: 'personalization',
@@ -330,6 +344,9 @@ export function useSettingsNavigation() {
           { tab: 'plugins', label: t('settings:plugins.scan_qr'), keywords: ['qr', '扫码', '绑定'] },
         ]
       : []),
+    ...(!hideProfiles
+      ? [{ tab: 'profiles', label: t('settings:tabs.profiles'), keywords: ['profile', 'user', 'account', '账套', '多用户', '账户', '切换'] }]
+      : []),
     { tab: 'search', label: t('settings:search_engine.title'), keywords: ['search engine', 'google', 'bing', 'tavily', 'searxng', 'deepseek'] },
     { tab: 'search', label: 'SearXNG', keywords: ['searxng', 'search'] },
     { tab: 'search', label: 'Tavily', keywords: ['tavily', 'search', 'api'] },
@@ -346,7 +363,7 @@ export function useSettingsNavigation() {
       ? [{ tab: 'shortcuts', label: t('settings:tabs.shortcuts'), keywords: ['shortcuts', 'keyboard', 'hotkey'] }]
       : []),
     { tab: 'about', label: t('settings:tabs.about'), keywords: ['about', 'version', 'acknowledgements'] },
-  ], [t, hidePlugins, hideShortcuts, hideWorkbench]);
+  ], [t, hidePlugins, hideShortcuts, hideWorkbench, hideProfiles]);
 
   // Index section titles as well as individual controls, so old names remain
   // discoverable after their entries move into categories.

@@ -104,6 +104,7 @@ impl FeishuBotPlugin {
         let _ = db.delete_secret(CREDENTIALS_KEY);
         let _ = db.delete_setting(CREDENTIALS_KEY);
         let _ = db.delete_setting(&format!("{}bound_open_id", SETTINGS_PREFIX));
+        let _ = db.delete_setting(&format!("{}bound_chat_id", SETTINGS_PREFIX));
         Ok(())
     }
 
@@ -435,6 +436,12 @@ impl FeishuBotPlugin {
             events::emit_activity(&ctx.app, PLUGIN_ID, "warn", "非绑定用户消息已忽略");
             return;
         }
+
+        // 记录/刷新绑定者的私聊会话 ID（桌面端主动推送出站寻址用；chat_id 变化时自动跟随）
+        let _ = db.save_setting(
+            &format!("{}bound_chat_id", SETTINGS_PREFIX),
+            &inbound.chat_id,
+        );
 
         // 附件入库（在限流前执行：重投会命中去重，代价低）
         let (ingested, attach_errors) = self.ingest_attachments(ctx, creds, &inbound).await;
@@ -904,9 +911,82 @@ impl ChannelPlugin for FeishuBotPlugin {
     async fn logout(&self, database: &Database) -> Result<(), AppError> {
         // 解绑 = 清绑定关系；凭证保留（重新启用无需重填）
         let _ = database.delete_setting(&format!("{}bound_open_id", SETTINGS_PREFIX));
+        let _ = database.delete_setting(&format!("{}bound_chat_id", SETTINGS_PREFIX));
         self.set_activity("已解绑");
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// 桌面端主动推送（对齐 openclaw 官方出站做法：文本分片 + 媒体先上传再发送）
+// ---------------------------------------------------------------------------
+
+/// 桌面端主动推送：向绑定的飞书私聊发送文本 / 图片 / 文件。
+///
+/// - 目标会话 = 绑定者最近一次私聊的 chat_id（自动记录，见 handle_inbound）。
+/// - 图片走 `POST /im/v1/images`（image_key），文件走 `POST /im/v1/files`
+///   （file_key，file_type 为 multipart 表单字段）。
+/// - 任意一项失败即中止并返回错误（已发送的部分不回滚，与逐条发送语义一致）。
+#[tauri::command]
+pub async fn feishu_push_message(
+    app: tauri::AppHandle,
+    text: Option<String>,
+    image_paths: Option<Vec<String>>,
+    file_paths: Option<Vec<String>>,
+) -> Result<String, AppError> {
+    use std::sync::Arc;
+    let db = app.state::<Arc<Database>>();
+    let creds = FeishuBotPlugin::load_credentials(&db)?.ok_or_else(|| {
+        AppError::validation("飞书凭证未配置，请先在设置 → 插件中填写 App ID / App Secret")
+    })?;
+    let chat_id = FeishuBotPlugin::read_setting(
+        &db,
+        &format!("{}bound_chat_id", SETTINGS_PREFIX),
+    )
+    .filter(|s| !s.trim().is_empty())
+    .ok_or_else(|| {
+        AppError::validation("尚无绑定的飞书会话：请先用绑定账号给机器人发一条消息")
+    })?;
+
+    let client = FeishuClient::new();
+    let mut sent: Vec<String> = Vec::new();
+
+    if let Some(t) = text.filter(|s| !s.trim().is_empty()) {
+        for chunk in chunk_text(&t, OUTBOUND_CHUNK_LIMIT) {
+            client.send_text(&creds, &chat_id, &chunk).await?;
+        }
+        sent.push("文本".to_string());
+    }
+
+    for path in image_paths.unwrap_or_default().iter() {
+        let p = std::path::Path::new(path);
+        client.send_image(&creds, &chat_id, p).await?;
+        sent.push(format!(
+            "图片 {}",
+            p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+        ));
+    }
+
+    for path in file_paths.unwrap_or_default().iter() {
+        let p = std::path::Path::new(path);
+        client.send_file(&creds, &chat_id, p).await?;
+        sent.push(format!(
+            "文件 {}",
+            p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+        ));
+    }
+
+    if sent.is_empty() {
+        return Err(AppError::validation("没有可发送的内容（文本/图片/文件均为空）"));
+    }
+
+    events::emit_activity(
+        &app,
+        PLUGIN_ID,
+        "msg_out",
+        &format!("桌面端推送: {}", sent.join("、")),
+    );
+    Ok(format!("已发送 {}", sent.join("、")))
 }
 
 #[cfg(test)]

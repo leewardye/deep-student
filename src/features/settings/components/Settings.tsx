@@ -150,6 +150,7 @@ const ApisTab = React.lazy(() => import('./ApisTab').then((module) => ({ default
 const ExternalSearchTab = React.lazy(() => import('./ExternalSearchTab').then((module) => ({ default: module.ExternalSearchTab })));
 const ModelsTab = React.lazy(() => import('./ModelsTab').then((module) => ({ default: module.ModelsTab })));
 const PluginsTab = React.lazy(() => import('./plugins/PluginsTab').then((module) => ({ default: module.PluginsTab })));
+const ProfilesTab = React.lazy(() => import('./ProfilesTab').then((module) => ({ default: module.ProfilesTab })));
 const McpToolsSection = React.lazy(() => import('./McpToolsSection').then((module) => ({ default: module.McpToolsSection })));
 const AutomationSettingsSection = React.lazy(() => import('./AutomationSettingsSection').then((module) => ({ default: module.AutomationSettingsSection })));
 const SuperAgentSettingsSection = React.lazy(() => import('./SuperAgentSettingsSection').then((module) => ({ default: module.SuperAgentSettingsSection })));
@@ -1453,6 +1454,7 @@ export const Settings: React.FC<SettingsProps> = ({ onBack, isActive = true }) =
             saveSingleAssignmentField={saveSingleAssignmentField}
           />
         )}
+        {activeTab === 'profiles' && !isMobilePlatform() && <ProfilesTab />}
         {activeTab === 'plugins' && !isMobilePlatform() && (
           <PluginsTab models={toUnifiedModelInfo(getAllEnabledApis())} />
         )}
