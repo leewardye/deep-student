@@ -342,16 +342,19 @@ pub fn profile_switch(app: tauri::AppHandle, profile_id: String) -> Result<(), A
         .lock()
         .map_err(|_| AppError::internal("账套注册表锁不可用"))?;
     let mut reg = load_registry(&base);
-    let meta = reg
-        .profiles
-        .iter_mut()
-        .find(|p| p.id == profile_id)
-        .ok_or_else(|| AppError::validation(format!("账套 {} 不存在", profile_id)))?
-        ;
-    meta.last_used_at_ms = now_ms();
-    reg.active_profile_id = Some(meta.id.clone());
+    // 在可变借用结束前取出日志所需字段，避免 meta 的 &mut 借用跨越 save_registry 的不可变借用（E0502）
+    let (profile_name, profile_id) = {
+        let meta = reg
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == profile_id)
+            .ok_or_else(|| AppError::validation(format!("账套 {} 不存在", profile_id)))?;
+        meta.last_used_at_ms = now_ms();
+        (meta.name.clone(), meta.id.clone())
+    };
+    reg.active_profile_id = Some(profile_id.clone());
     save_registry(&base, &reg)?;
-    tracing::info!("[profiles] 切换到账套 {} ({}), 即将重启", meta.name, meta.id);
+    tracing::info!("[profiles] 切换到账套 {} ({}), 即将重启", profile_name, profile_id);
     app.restart();
     unreachable!("profile_switch: 应用应已重启")
 }
