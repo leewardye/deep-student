@@ -1418,12 +1418,31 @@ pub async fn run_headless_agent_turn(
 
     let content = summarize_assistant_message(&chat_v2_db, &assistant_message_id);
 
+    // IM/自动化会话的流式事件在 headless 下全部丢弃（NoopEventSink），桌面端
+    // 若在 turn 执行期间打开该会话，只会看到空内容且永远等不到更新。这里在
+    // turn 完成时广播一次，前端据此刷新列表/重载当前打开的会话。
+    emit_headless_turn_event(app, &req.session_id);
+
     Ok(HeadlessTurnOutcome {
         session_id: req.session_id,
         assistant_message_id,
         content,
         duration_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// 广播 headless turn 完成事件（与远程会话创建共用同一事件名/负载形态）。
+fn emit_headless_turn_event(app: &AppHandle, session_id: &str) {
+    use tauri::Emitter;
+    if let Err(e) = app.emit(
+        super::task_command::REMOTE_SESSIONS_CHANGED_EVENT,
+        json!({ "session_id": session_id }),
+    ) {
+        log::warn!(
+            "[ChatV2::headless] emit remote_sessions_changed failed: {}",
+            e
+        );
+    }
 }
 
 // ============================================================================
