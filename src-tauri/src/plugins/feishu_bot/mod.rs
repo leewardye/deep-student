@@ -352,10 +352,13 @@ impl FeishuBotPlugin {
             if ctx.cancel.is_cancelled() {
                 return;
             }
-            let mut reader = match bridge::spawn(&ctx.app, &creds.app_id, &creds.app_secret).await {
-                Ok(r) => r,
+            let mut proc = match bridge::spawn(&ctx.app, &creds.app_id, &creds.app_secret).await {
+                Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("[feishubot] bridge spawn failed: {}", e);
+                    // 诊断区也要可见（不依赖日志文件），UI「运行诊断」直接显示
+                    diag_push_line(format!("[spawn-error] {}", e));
+                    self.set_activity(&format!("飞书桥启动失败: {}", e));
                     manager
                         .set_state(PLUGIN_ID, PluginState::Error, Some(e.to_string()))
                         .await;
@@ -369,13 +372,44 @@ impl FeishuBotPlugin {
             reconnect_failures = 0;
             self.set_activity("飞书长连接已建立");
 
-            loop {
+            let mut stderr_dead = false;
+            let mut err_line = String::new();
+            'event_loop: loop {
+                // stderr 行：桥的启动错误（node 版本/SDK 加载失败）都在这里，
+                // 不读就会丢失（pipe 塞满还会把子进程卡死）。EOF/错误后置
+                // stderr_dead，防止该分支持续就绪把 stdout 事件饿死。
                 let event = tokio::select! {
                     _ = ctx.cancel.cancelled() => return,
-                    ev = bridge::read_event(&mut reader) => ev,
+                    n = async {
+                        if stderr_dead {
+                            std::future::pending::<std::io::Result<usize>>().await
+                        } else {
+                            bridge::read_stderr_line(&mut proc.stderr, &mut err_line).await
+                        }
+                    } => {
+                        match n {
+                            Ok(0) | Err(_) => stderr_dead = true,
+                            _ => {}
+                        }
+                        continue 'event_loop;
+                    }
+                    ev = bridge::read_event(&mut proc.stdout) => ev,
                 };
                 match event {
                     Ok(Some(ev)) => match ev.name.as_str() {
+                        "bridge.exit" => {
+                            // 子进程退出（stdout EOF）：必须显式重连。此前 None
+                            // 被当空行忽略导致忙旋转（v0.12.2 修复）
+                            let code = proc.child.try_wait().ok().flatten()
+                                .map(|s| s.code().unwrap_or(-1).to_string())
+                                .unwrap_or_else(|| "信号终止".to_string());
+                            let out = format!("飞书桥进程退出（exit {}）", code);
+                            tracing::warn!("[feishubot] {}", out);
+                            diag_push_line(format!("[bridge-exit] {}", out));
+                            self.set_activity(&out);
+                            events::emit_activity(&ctx.app, PLUGIN_ID, "warn", &out);
+                            break 'event_loop; // 触发重连
+                        }
                         "bridge.error" => {
                             // 桥进程/SDK 错误必须让用户看得见（常见：appId 无效、
                             // 无事件订阅权限、长连接被踢等）
