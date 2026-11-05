@@ -343,6 +343,54 @@ fn use_base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// 把已入库的附件构造成上下文引用，直通 headless 管线的
+/// `user_context_refs`——与桌面端发图同一条多模态编译路径，模型直接
+/// 看到图片像素（此前 IM 附件只以文本清单进入提示词，模型看不见图，
+/// 只能依赖资源库 OCR 文本，OCR 索引一失败就「读不到图上的内容」）。
+///
+/// - 图片：formatted_blocks 内嵌 base64 内容块（编译器优先走 VFS blob，
+///   这里的块是无 VFS 记录时的确定性兜底）。
+/// - 非图片：不填内容块，编译器生成 FileRef 描述符（文本/PDF 等仍可被
+///   附件工具按 resource_id 读取）。
+/// - 读取落盘文件失败（理论上不可能，刚写完）时跳过该附件，不阻断主流程。
+pub fn attachment_context_refs(atts: &[IngestedAttachment]) -> Vec<crate::chat_v2::SendContextRef> {
+    use crate::chat_v2::{ContentBlock, SendContextRef};
+    let mut refs = Vec::new();
+    for att in atts {
+        let Some(vfs_id) = att.vfs_id.clone() else {
+            continue;
+        };
+        let formatted_blocks = match att.kind {
+            AttachKind::Image => {
+                let Ok(bytes) = std::fs::read(&att.local_path) else {
+                    continue;
+                };
+                let media_type = mime_for(att).to_string();
+                vec![ContentBlock::Image {
+                    media_type,
+                    base64: use_base64(&bytes),
+                }]
+            }
+            _ => Vec::new(),
+        };
+        refs.push(SendContextRef {
+            resource_id: vfs_id,
+            // VFS 侧已有内容哈希去重；此哈希仅作编译器回退路径的 content_hash
+            hash: String::new(),
+            // 注意不要含 "file"/"pdf"/"textbook" 字样——tool_loop 的视觉质量
+            // 自动策略按 type_id 关键词降压缩档位，单图应保持 high
+            type_id: match att.kind {
+                AttachKind::Image => "image".to_string(),
+                _ => "attachment".to_string(),
+            },
+            formatted_blocks,
+            display_name: Some(att.display_name.clone()),
+            inject_modes: None,
+        });
+    }
+    refs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

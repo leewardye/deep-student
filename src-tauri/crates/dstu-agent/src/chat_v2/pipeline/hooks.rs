@@ -1342,12 +1342,26 @@ impl ChatV2Pipeline {
             None, // variant_id
         );
 
+        // 远程任务会话（IM 创建）：审批请求同步推送到用户 IM，
+        // 用户回复「批准 <码>」/「拒绝 <码>」经 task_command 回灌响应
+        if crate::chat_v2::headless::is_remote_task_session(session_id) {
+            crate::chat_v2::remote_approval::push_approval(
+                session_id,
+                &tool_call.id,
+                &tool_call.name,
+                &request.description,
+                timeout_seconds,
+            );
+        }
+
         // 等待响应或超时
         // 🔧 F7 修复：同时监听流取消信号 —— 用户停止生成时立即清理 pending 审批
         // 并退出等待，不再让审批 sender 残留到 60s 超时
         let timeout_duration = std::time::Duration::from_secs(timeout_seconds as u64);
         let wait_result =
             wait_oneshot_with_optional_cancel(rx, timeout_duration, cancellation_token).await;
+        // 无论结果如何，远程审批条目都已完成（响应/超时/取消），移除待确认表
+        crate::chat_v2::remote_approval::remove(&tool_call.id);
 
         let Some(timeout_result) = wait_result else {
             // 流被取消：清理 pending 审批并通知前端关闭审批卡片

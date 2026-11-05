@@ -608,6 +608,7 @@ impl IlinkBotPlugin {
                                     message_id: dedup_key,
                                     text: full_text.clone(),
                                     chat,
+                                    context_refs: crate::plugins::im_media::attachment_context_refs(&ingested),
                                 });
 
                                 match outcome {
@@ -787,6 +788,13 @@ async fn run_remote_task(
         );
         return;
     }
+    // 远程审批：登记会话路由。微信通道暂无主动推送，写白名单对其不放行
+    // （remote_approval::write_tools_allowed_for 按通道判定），仅保留查询能力
+    crate::chat_v2::remote_approval::remember_route(
+        &session_id,
+        task_command::CHANNEL_ILINK_WECHAT,
+        &peer,
+    );
     // 3. 经 headless 通路执行（无人审批、只读白名单、硬超时）
     let mut turn =
         task_command::build_session_turn(&plan, session_id.clone(), model_id, system_append);
@@ -864,6 +872,8 @@ impl ChannelPlugin for IlinkBotPlugin {
     }
 
     async fn run(&self, ctx: PluginRuntimeCtx) -> Result<(), AppError> {
+        // 远程审批：注入 App 句柄（微信通道暂不注册推送闭包——无主动推送能力）
+        self.tasks.set_app_handle(ctx.app.clone());
         // If not bound, run login first
         let creds = match Self::load_credentials(&ctx.database)? {
             Some(c) => c,

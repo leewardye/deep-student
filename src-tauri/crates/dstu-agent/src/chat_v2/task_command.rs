@@ -26,7 +26,7 @@
 //! （落库预留）；会话级绑定以 JSON 写入 ChatV2 会话 metadata。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::database::ChatV2Database;
 use super::headless::{HeadlessSessionTurn, DEFAULT_HARD_TIMEOUT_SECS};
+use super::resource_types::SendContextRef;
 use super::state::ChatV2State;
 
 /// iLink 微信渠道的 channel 标识
@@ -213,6 +214,26 @@ pub fn parse_inbound(text: &str) -> ParsedInbound {
             _ => {}
         }
     }
+    // 批准/拒绝 + 可选短码（远程审批）：裸词或「前缀 + ≤8 位字母数字短码」。
+    // 短码之外的后续文本（如自然语言）不当作审批命令，回退普通消息走闲聊/任务。
+    for (prefix, decision) in [
+        ("批准", ApprovalDecision::Approve),
+        ("同意", ApprovalDecision::Approve),
+        ("拒绝", ApprovalDecision::Reject),
+    ] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let code = rest.trim();
+            let code_ok = code.is_empty()
+                || (code.chars().count() <= 8
+                    && code.chars().all(|c| c.is_ascii_alphanumeric()));
+            if code_ok {
+                return ParsedInbound::Command(TaskCommand::Approve {
+                    approval_id: code.to_string(),
+                    decision,
+                });
+            }
+        }
+    }
     match t.to_ascii_lowercase().as_str() {
         "stop" | "cancel" | "停止" | "取消" | "停止任务" | "取消任务" => {
             ParsedInbound::Command(TaskCommand::Stop { task_id: None })
@@ -220,14 +241,6 @@ pub fn parse_inbound(text: &str) -> ParsedInbound {
         "status" | "progress" | "状态" | "进展" | "进度" | "任务状态" => {
             ParsedInbound::Command(TaskCommand::Inspect { task_id: None })
         }
-        "批准" | "同意" => ParsedInbound::Command(TaskCommand::Approve {
-            approval_id: String::new(),
-            decision: ApprovalDecision::Approve,
-        }),
-        "拒绝" => ParsedInbound::Command(TaskCommand::Approve {
-            approval_id: String::new(),
-            decision: ApprovalDecision::Reject,
-        }),
         "帮助" | "help" => ParsedInbound::Help,
         _ => ParsedInbound::Message(t.to_string()),
     }
@@ -242,7 +255,7 @@ pub fn help_text() -> String {
      · 停止 或 /stop = 停止当前任务\n\
      · 进展 或 /status = 查看任务状态\n\
      · 发送图片/文件会自动存入资源库，并在回复里告诉你路径\n\
-     · 写操作审批需在桌面端确认"
+     · 写操作（题库录入等）会推送确认请求到飞书：回复「批准 <短码>」执行，「拒绝 <短码>」放弃"
         .to_string()
 }
 
@@ -309,6 +322,10 @@ pub struct InboundRemote {
     /// 闲聊意图：true = 由 IM 侧意图分类器判定为普通对话，
     /// 路由时静默启动（无「已创建任务」确认），会话用闲聊提示词
     pub chat: bool,
+    /// 随消息附带的上下文引用（IM 附件入库后的 VFS 引用，含图片内容块），
+    /// 直通 headless 管线的 user_context_refs，让模型直接看到图片像素
+    /// （与桌面端发图同一条多模态编译路径）。
+    pub context_refs: Vec<SendContextRef>,
 }
 
 /// 待执行的 headless turn 计划
@@ -327,6 +344,8 @@ pub struct PlannedTurn {
     pub binding: RemoteBinding,
     /// 闲聊轮：无任务确认、使用闲聊 system prompt
     pub chat: bool,
+    /// 随消息附带的上下文引用（见 InboundRemote::context_refs）
+    pub context_refs: Vec<SendContextRef>,
 }
 
 /// dispatch 结果：调用方据此回复/启动/取消
@@ -371,6 +390,16 @@ struct Inner {
 #[derive(Default)]
 pub struct RemoteTaskManager {
     inner: Mutex<Inner>,
+    /// App 句柄（插件启动时注入一次）。用于「批准/拒绝」命令回灌
+    /// ApprovalManager；测试路径不注入，Approve 走桌面端指引兜底。
+    app: OnceLock<AppHandle>,
+}
+
+impl RemoteTaskManager {
+    /// 插件启动时注入 App 句柄（幂等；重复注入忽略后者）
+    pub fn set_app_handle(&self, app: AppHandle) {
+        let _ = self.app.set(app);
+    }
 }
 
 fn now_ms() -> i64 {
@@ -421,11 +450,19 @@ impl RemoteTaskManager {
         match parse_inbound(&inbound.text) {
             ParsedInbound::Help => DispatchOutcome::Reply(help_text()),
             ParsedInbound::Message(text) => {
-                Self::route_message(&mut inner, &route, &inbound.binding, generation, text, inbound.chat)
+                Self::route_message(
+                    &mut inner,
+                    &route,
+                    &inbound.binding,
+                    generation,
+                    text,
+                    inbound.chat,
+                    inbound.context_refs,
+                )
             }
             ParsedInbound::Command(TaskCommand::Create { goal }) => {
                 // 显式 /new 命令：强制建任务，不参与闲聊判定
-                Self::create_task(&mut inner, &route, &inbound.binding, generation, goal, false)
+                Self::create_task(&mut inner, &route, &inbound.binding, generation, goal, false, Vec::new())
             }
             ParsedInbound::Command(TaskCommand::Steer { task_id, text }) => Self::steer_explicit(
                 &mut inner,
@@ -441,9 +478,36 @@ impl RemoteTaskManager {
             ParsedInbound::Command(TaskCommand::Inspect { task_id }) => {
                 Self::inspect_task(&inner, &route, task_id)
             }
-            // 远程批准写操作属 P2：P1 只给桌面端确认指引
-            ParsedInbound::Command(TaskCommand::Approve { .. }) => {
-                DispatchOutcome::Reply(APPROVE_GUIDANCE.to_string())
+            // 远程批准写操作（v0.13.0）：飞书绑定会话的受控写工具审批，
+            // 「批准/拒绝 [短码]」回灌 ApprovalManager；无 App 句柄（测试）
+            // 或未注入时回退桌面端指引
+            ParsedInbound::Command(TaskCommand::Approve {
+                approval_id,
+                decision,
+            }) => {
+                let approve = matches!(decision, ApprovalDecision::Approve);
+                match self.app.get() {
+                    Some(app) => DispatchOutcome::Reply(super::remote_approval::resolve(
+                        app,
+                        // 会话提示：路由当前活跃/最近任务的绑定会话
+                        {
+                            inner
+                                .routes
+                                .get(&route)
+                                .and_then(|rs| {
+                                    rs.active_task
+                                        .as_deref()
+                                        .or(rs.latest_task.as_deref())
+                                })
+                                .and_then(|tid| inner.tasks.get(tid))
+                                .and_then(|r| r.binding.conversation_id.clone())
+                        }
+                        .as_deref(),
+                        &approval_id,
+                        approve,
+                    )),
+                    None => DispatchOutcome::Reply(APPROVE_GUIDANCE.to_string()),
+                }
             }
         }
     }
@@ -456,6 +520,7 @@ impl RemoteTaskManager {
         generation: u64,
         text: String,
         chat: bool,
+        refs: Vec<SendContextRef>,
     ) -> DispatchOutcome {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -471,7 +536,7 @@ impl RemoteTaskManager {
                 Some(RemoteTaskStatus::Running)
             ) {
                 return DispatchOutcome::Reply(format!(
-                    "任务 #{} 正在运行中。\n发送「停止」中止后再补充，或发送「进展」查看状态。",
+                    "任务 #{} 还在运行，暂时接收不了新指令。\n发「停止」可中止后再补充，或发「进展」查看当前进度。",
                     active_id
                 ));
             }
@@ -486,10 +551,12 @@ impl RemoteTaskManager {
                 .get(&latest_id)
                 .is_some_and(|r| r.status.is_terminal() && r.binding.conversation_id.is_some());
             if steerable {
-                return Self::steer_existing(inner, route, binding, generation, &latest_id, text, chat);
+                return Self::steer_existing(
+                    inner, route, binding, generation, &latest_id, text, chat, refs,
+                );
             }
         }
-        Self::create_task(inner, route, binding, generation, text, chat)
+        Self::create_task(inner, route, binding, generation, text, chat, refs)
     }
 
     /// Create：登记 Running 记录并返回 Launch 计划（会话由调用方创建后 attach）。
@@ -500,6 +567,7 @@ impl RemoteTaskManager {
         generation: u64,
         goal: String,
         chat: bool,
+        refs: Vec<SendContextRef>,
     ) -> DispatchOutcome {
         let goal = goal.trim().to_string();
         if goal.is_empty() {
@@ -533,7 +601,8 @@ impl RemoteTaskManager {
                 String::new()
             } else {
                 format!(
-                    "已创建任务 #{}，正在运行。\n完成后会主动通知你；发送「停止」可中止，发送「进展」查看状态。",
+                    "收到，开始处理：{}\n（任务 #{}）完成后我会主动汇报；发「停止」可中止，发「进展」看进度。",
+                    truncate_chars(&goal, 30),
                     task_id
                 )
             },
@@ -549,6 +618,7 @@ impl RemoteTaskManager {
                 existing_session_id: None,
                 binding: bound,
                 chat,
+                context_refs: refs,
             },
         }
     }
@@ -578,7 +648,7 @@ impl RemoteTaskManager {
             return DispatchOutcome::Reply(format!("任务 #{} 不可继续（会话未建立）。", task_id));
         }
         // 显式 /stop-id + 文本：始终按任务推进处理，不走闲聊
-        Self::steer_existing(inner, route, binding, generation, task_id, text, false)
+        Self::steer_existing(inner, route, binding, generation, task_id, text, false, Vec::new())
     }
 
     /// Steer 推进：同会话追加一轮，记录回到 Running。
@@ -590,6 +660,7 @@ impl RemoteTaskManager {
         task_id: &str,
         text: String,
         chat: bool,
+        refs: Vec<SendContextRef>,
     ) -> DispatchOutcome {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -615,7 +686,12 @@ impl RemoteTaskManager {
             ack: if chat {
                 String::new()
             } else {
-                format!("已继续任务 #{}，正在运行。", task_id)
+                format!(
+                    "收到，接着任务 #{}（{}）继续：{}\n完成后我会主动汇报。",
+                    task_id,
+                    goal_preview,
+                    truncate_chars(&text, 40)
+                )
             },
             plan: PlannedTurn {
                 task_id: task_id.to_string(),
@@ -629,6 +705,7 @@ impl RemoteTaskManager {
                 existing_session_id: session_id,
                 binding: plan_binding,
                 chat,
+                context_refs: refs,
             },
         }
     }
@@ -806,7 +883,7 @@ impl RemoteTaskManager {
     ) -> Option<String> {
         debug_assert!(status.is_terminal());
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let (route, already_cancelled, id) = {
+        let (route, already_cancelled, id, goal_preview) = {
             let rec = inner.tasks.get_mut(task_id)?;
             if expected_generation
                 .map(|generation| rec.binding.generation != generation)
@@ -820,6 +897,7 @@ impl RemoteTaskManager {
                 rec.status = status;
             }
             rec.updated_at_ms = now_ms();
+            let goal_preview = truncate_chars(rec.goal.trim(), 20);
             let trimmed = summary.trim();
             if !trimmed.is_empty() {
                 rec.last_summary = Some(truncate_chars(trimmed, REPLY_SUMMARY_MAX_CHARS));
@@ -827,7 +905,7 @@ impl RemoteTaskManager {
             if let Some(e) = error {
                 rec.last_error = Some(truncate_chars(e, 500));
             }
-            (route, already_cancelled, rec.task_id.clone())
+            (route, already_cancelled, rec.task_id.clone(), goal_preview)
         };
         if let Some(rs) = inner.routes.get_mut(&route) {
             if rs.active_task.as_deref() == Some(task_id) {
@@ -841,23 +919,27 @@ impl RemoteTaskManager {
             RemoteTaskStatus::Completed => {
                 let trimmed = summary.trim();
                 if trimmed.is_empty() {
-                    format!("任务 #{} 已完成。", id)
+                    format!("任务 #{}（{}）已完成。", id, goal_preview)
                 } else {
                     format!(
-                        "任务 #{} 已完成\n\n{}",
+                        "任务 #{}（{}）已完成，结果如下：\n\n{}",
                         id,
+                        goal_preview,
                         truncate_chars(trimmed, REPLY_SUMMARY_MAX_CHARS)
                     )
                 }
             }
             RemoteTaskStatus::Timeout => format!(
-                "任务 #{} 超时，已保存部分结果。\n发送任意消息可在原会话上继续。",
-                id
+                "任务 #{}（{}）超时了，已保存部分结果。\n发送任意消息可以在原会话上继续。",
+                id, goal_preview
             ),
-            RemoteTaskStatus::Failed => {
-                format!("任务 #{} 失败：{}", id, error.unwrap_or("未知错误"))
-            }
-            RemoteTaskStatus::Cancelled => format!("任务 #{} 已停止。", id),
+            RemoteTaskStatus::Failed => format!(
+                "任务 #{}（{}）执行失败：{}\n需要重试的话再发一次消息即可。",
+                id,
+                goal_preview,
+                error.unwrap_or("未知错误")
+            ),
+            RemoteTaskStatus::Cancelled => format!("任务 #{}（{}）已停止。", id, goal_preview),
             RemoteTaskStatus::Running => unreachable!("finish_turn requires terminal status"),
         })
     }
@@ -966,6 +1048,8 @@ pub fn build_session_turn(
         system_prompt_append,
         timeout: Duration::from_secs(DEFAULT_HARD_TIMEOUT_SECS),
         cancellation_token: None,
+        context_refs: plan.context_refs.clone(),
+        remote_task: true,
     }
 }
 
@@ -1014,6 +1098,7 @@ mod tests {
             message_id: message_id.into(),
             text: text.into(),
             chat: false,
+            context_refs: Vec::new(),
         }
     }
 

@@ -57,6 +57,7 @@ pub mod state;
 pub mod super_session; // Super 会话：普通 chat_v2 会话 + metadata 标记；Router 提示词/工具注入、Worker 收件箱投递、外部事件入口
 pub mod task_audit; // Deterministic task audit manifests and export redaction
 pub mod task_command; // 🆕 G10-P1：远程渠道入站统一 TaskCommand（iLink 接入同一 ChatV2 任务运行系统）
+pub mod remote_approval; // 🆕 v0.13.0：远程任务写操作审批（IM 推送批准/拒绝）
                       // Unified file/message/event/record identity and delivery receipts（已下沉 dstu-core，旧路径保留）
 pub use dstu_core::task_objects;
 pub mod tool_approval_policy;

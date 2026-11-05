@@ -63,6 +63,7 @@ use super::error::{ChatV2Error, ChatV2Result};
 use super::events::ChatV2EventEmitter;
 use super::pipeline::ChatV2Pipeline;
 use super::repo::ChatV2Repo;
+use super::resource_types::SendContextRef;
 use super::state::{ChatV2State, StreamGuard};
 use super::tool_descriptors;
 use super::tools::attempt_completion::is_attempt_completion;
@@ -73,6 +74,35 @@ use super::types::{
 
 static TRUSTED_AUTOMATION_SESSIONS: LazyLock<StdMutex<HashMap<String, TrustedAutomationProfile>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// 远程任务会话注册表（IM 创建/推进的 headless 会话）。
+/// run_headless_agent_turn 入口登记；用于：(1) 工具面对飞书绑定会话
+/// 放行 [`super::remote_approval::REMOTE_TASK_WRITE_TOOLS`]（仍需逐次
+/// IM 审批）；(2) 审批请求推送到 IM。条目有上限，防长期增长。
+static REMOTE_TASK_SESSIONS: LazyLock<StdMutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| StdMutex::new(std::collections::HashSet::new()));
+
+const REMOTE_TASK_SESSIONS_CAP: usize = 500;
+
+/// 登记/查询远程任务会话（headless.rs 内部 + remote_approval 联动）
+pub fn mark_remote_task_session(session_id: &str) {
+    let mut set = REMOTE_TASK_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if set.len() >= REMOTE_TASK_SESSIONS_CAP {
+        // 简单淘汰：清空最旧一半（HashSet 无序，数量大时才触发，语义可接受）
+        let keep: std::collections::HashSet<String> = set.iter().skip(REMOTE_TASK_SESSIONS_CAP / 2).cloned().collect();
+        *set = keep;
+    }
+    set.insert(session_id.to_string());
+}
+
+pub fn is_remote_task_session(session_id: &str) -> bool {
+    REMOTE_TASK_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(session_id)
+}
 
 struct TrustedAutomationSessionGuard {
     session_id: String,
@@ -635,6 +665,196 @@ pub const LEGACY_HEADLESS_ALLOWED_TOOLS: &[&str] = &[
     "builtin-review_get_due",
     "builtin-review_stats",
 ];
+
+/// 远程任务会话（飞书绑定）放行的写工具 schema 精简副本。
+///
+/// 字段语义与前端 `src/features/chat/skills/builtin-tools/qbank-tools.ts`
+/// 的 embeddedTools 定义保持一致（同步自 v0.13.0 时点）；工具的敏感度、
+/// 执行器与参数校验仍由后端 registry/executor 权威裁定——本函数只决定
+/// 模型「看得见」哪些工具，不是授权源。
+fn remote_task_write_tool_schemas() -> Vec<McpToolSchema> {
+    fn tool(name: &str, description: &str, input_schema: Value) -> McpToolSchema {
+        McpToolSchema {
+            name: name.to_string(),
+            server_id: None,
+            description: Some(description.to_string()),
+            input_schema: Some(input_schema),
+        }
+    }
+    let question_type_enum = json!([
+        "single_choice", "multiple_choice", "indefinite_choice", "fill_blank",
+        "true_false", "matching", "ordering", "numeric", "short_answer",
+        "essay", "calculation", "proof", "other",
+    ]);
+    let source_ref_schema = json!({
+        "type": "object",
+        "properties": {
+            "source_id": { "type": "string", "minLength": 1, "description": "真实来源ID，非名称" },
+            "page": { "description": "原始页号；未知 null", "anyOf": [ { "type": "integer", "minimum": 1 }, { "enum": [null] } ] },
+        },
+        "required": ["source_id"],
+    });
+    vec![
+        tool(
+            "builtin-qbank_create_question",
+            "创建单题到题目集（需审批）。返回截断预览；选择题须非空 options。",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "session_id": { "type": "string", "minLength": 1, "description": "题目集 ID；远程任务通常省略由后端建默认集" },
+                    "content": { "type": "string", "minLength": 1, "maxLength": 50000 },
+                    "question_label": { "type": "string", "maxLength": 120 },
+                    "question_type": { "type": "string", "enum": question_type_enum.clone(), "default": "other" },
+                    "structured_data": { "type": "object" },
+                    "options": {
+                        "type": "array", "maxItems": 26,
+                        "items": {
+                            "type": "object", "additionalProperties": false,
+                            "properties": {
+                                "key": { "type": "string", "minLength": 1 },
+                                "content": { "type": "string", "minLength": 1 },
+                            },
+                            "required": ["key", "content"],
+                        },
+                    },
+                    "answer": { "type": "string", "maxLength": 50000 },
+                    "explanation": { "type": "string", "maxLength": 100000 },
+                    "difficulty": { "type": "string", "enum": ["easy", "medium", "hard", "very_hard"] },
+                    "tags": { "type": "array", "maxItems": 50, "items": { "type": "string", "minLength": 1, "maxLength": 100 } },
+                    "images": {
+                        "type": "array",
+                        "items": {
+                            "type": "object", "additionalProperties": false,
+                            "properties": {
+                                "id": { "type": "string", "minLength": 1, "description": "VFS 附件 ID" },
+                                "name": { "type": "string" },
+                                "mime": { "type": "string" },
+                                "hash": { "type": "string", "description": "内容 SHA-256" },
+                            },
+                            "required": ["id"],
+                        },
+                    },
+                    "parent_id": { "type": "string", "maxLength": 200 },
+                    "parent_card_id": { "type": "string", "maxLength": 200 },
+                    "source_ref": { "type": "string", "maxLength": 1000 },
+                },
+                "required": ["content"],
+            }),
+        ),
+        tool(
+            "builtin-qbank_batch_import",
+            "提交当前对话模型的 v2 文档，原子保存材料/题组/子题，最多 200 题（需审批）。needs_review 不自动提交；仅 committed=true 表示成功。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "省略则新建题目集" },
+                    "name": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["extract", "generate"], "description": "extract=已有题抽取，禁止解题补答案；generate=新命题" },
+                    "schema_version": { "type": "integer", "enum": [2] },
+                    "idempotency_key": { "type": "string", "description": "同一创建任务重试使用相同键，不用于不同任务" },
+                    "materials": {
+                        "type": "array",
+                        "items": { "type": "object", "properties": { "local_id": { "type": "string" }, "content": { "type": "string" }, "source_refs": { "type": "array", "items": source_ref_schema.clone() } }, "required": ["local_id", "content"] },
+                        "description": "共享材料完整正文，须闭合 group.material_ids",
+                    },
+                    "groups": {
+                        "type": "array",
+                        "items": { "type": "object", "properties": { "local_id": { "type": "string" }, "label": { "type": "string" }, "material_ids": { "type": "array", "items": { "type": "string" } }, "question_ids": { "type": "array", "items": { "type": "string" } } }, "required": ["local_id", "material_ids", "question_ids"] },
+                    },
+                    "coverage": {
+                        "type": "array",
+                        "items": { "type": "object", "properties": { "source_id": { "type": "string" }, "page": { "description": "未知 null", "anyOf": [ { "type": "integer", "minimum": 1 }, { "enum": [null] } ] }, "status": { "type": "string", "enum": ["processed", "uncertain", "unprocessed"] } }, "required": ["source_id"] },
+                    },
+                    "issues": { "type": "array", "items": { "type": "object" } },
+                    "unmatched_answers": { "type": "array", "items": { "type": "object" } },
+                    "parent_card_id": { "type": "string", "description": "默认变式父题；题内值优先" },
+                    "questions": {
+                        "type": "array", "minItems": 1, "maxItems": 200,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "local_id": { "type": "string", "description": "文档内唯一身份，与 groups.question_ids 一致" },
+                                "group_id": { "type": "string", "description": "所属题组 local_id；独立题省略" },
+                                "original_label": { "type": "string", "description": "真实原题号，不用全局Q编号替代来源" },
+                                "section_path": { "type": "array", "items": { "type": "string" } },
+                                "source_refs": { "type": "array", "items": source_ref_schema.clone() },
+                                "answer_source_refs": { "type": "array", "items": source_ref_schema.clone() },
+                                "answer_origin": { "type": "string", "enum": ["source", "generated", "missing"] },
+                                "content": { "type": "string" },
+                                "answer": { "type": "string" },
+                                "explanation": { "type": "string" },
+                                "question_type": { "type": "string", "enum": question_type_enum.clone() },
+                                "options": {
+                                    "type": "array",
+                                    "items": { "type": "object", "properties": { "key": { "type": "string" }, "content": { "type": "string" } }, "required": ["key", "content"] },
+                                },
+                                "structured_data": { "type": "object" },
+                                "difficulty": { "type": "string", "enum": ["easy", "medium", "hard", "very_hard"] },
+                                "tags": { "type": "array", "items": { "type": "string" } },
+                                "parent_card_id": { "type": "string" },
+                            },
+                            "required": ["content"],
+                        },
+                    },
+                },
+                "required": ["questions"],
+            }),
+        ),
+        tool(
+            "builtin-qbank_import_document",
+            "从资源库文档/文本完整抽取已有题（需审批）。优先 resource_id；preview 只存草稿，用户明确导入才 commit；以 committed 回执报题数。",
+            json!({
+                "type": "object",
+                "anyOf": [ { "required": ["resource_id"] }, { "required": ["content"] } ],
+                "properties": {
+                    "mode": { "type": "string", "enum": ["preview", "commit"], "default": "preview" },
+                    "resource_id": { "type": "string", "description": "原始 file_*/res_*/note_*，与 content 二选一" },
+                    "content": { "type": "string", "description": "文本原文；docx 用 base64" },
+                    "format": { "type": "string", "enum": ["txt", "md", "docx", "json", "csv"], "default": "txt", "description": "content 的格式（传 resource_id 时忽略）" },
+                    "name": { "type": "string" },
+                    "session_id": { "type": "string", "description": "省略则新建题目集" },
+                    "folder_id": { "type": "string" },
+                    "source_ranges": {
+                        "type": "array",
+                        "description": "仅用户选定的原文范围，含必要材料/答案；未选页保留 partial，不静默拆分。",
+                        "items": { "type": "object", "properties": { "source_id": { "type": "string" }, "start_page": { "type": "integer", "minimum": 1 }, "end_page": { "type": "integer", "minimum": 1 } }, "required": ["source_id"] },
+                    },
+                },
+            }),
+        ),
+        tool(
+            "builtin-qbank_submit_answer",
+            "仅提交用户明确提供的答案，由后端判分（需审批）。Agent 不得猜测或代答。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "card_id": { "type": "string" },
+                    "user_answer": { "type": "string", "description": "用户提交的答案（字符串）；各题型序列化格式见题目回执说明" },
+                    "is_correct": { "type": "boolean", "description": "是否正确（省略则自动判断）" },
+                },
+                "required": ["session_id", "card_id", "user_answer"],
+            }),
+        ),
+        tool(
+            "builtin-qbank_toggle_favorite",
+            "OCC 切换收藏（需审批）。先读 updated_at；返回 previous.is_favorite 与精确 undo。",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "anyOf": [ { "required": ["question_id"] }, { "required": ["session_id", "card_id"] } ],
+                "properties": {
+                    "question_id": { "type": "string", "minLength": 1 },
+                    "session_id": { "type": "string", "minLength": 1 },
+                    "card_id": { "type": "string", "minLength": 1 },
+                    "expected_updated_at": { "type": "string", "minLength": 1, "description": "最新 updated_at" },
+                },
+                "required": ["expected_updated_at"],
+            }),
+        ),
+    ]
+}
 
 /// fail-closed 预过滤：从任意 schema 列表中剔除不在白名单内的工具。
 ///
@@ -1247,6 +1467,12 @@ pub struct HeadlessSessionTurn {
     pub timeout: std::time::Duration,
     /// Optional caller-owned token used to cancel the turn when its entry point stops.
     pub cancellation_token: Option<CancellationToken>,
+    /// 随消息附带的上下文引用（IM 附件 / 自动化产物）。图片引用经上下文
+    /// 编译器解析为多模态内容——与桌面端发图同一条路径；空 = 无附件。
+    pub context_refs: Vec<SendContextRef>,
+    /// IM 远程任务会话（task_command::build_session_turn 产出时为 true）。
+    /// 仅此标记的会话在飞书绑定路由下获得受控写工具（逐次 IM 审批）。
+    pub remote_task: bool,
 }
 
 /// 底层执行结果
@@ -1330,6 +1556,7 @@ pub async fn run_headless_turn(
         max_tool_rounds,
         req.cancellation_token,
         req.trusted_profile.as_ref(),
+        Vec::new(),
     )
     .await;
 
@@ -1401,6 +1628,10 @@ pub async fn run_headless_agent_turn(
     let timeout = clamp_session_turn_timeout(req.timeout, &req.session_id);
 
     let assistant_message_id = ChatMessage::generate_id();
+    let context_refs = req.context_refs;
+    if req.remote_task {
+        mark_remote_task_session(&req.session_id);
+    }
     execute_headless_pipeline(
         app,
         &req.session_id,
@@ -1412,6 +1643,7 @@ pub async fn run_headless_agent_turn(
         None,
         req.cancellation_token,
         None,
+        context_refs,
     )
     .await
     .map_err(HeadlessPipelineTermination::into_message)?;
@@ -1599,6 +1831,7 @@ async fn execute_headless_pipeline(
     max_tool_rounds_override: Option<u32>,
     external_cancellation_token: Option<CancellationToken>,
     trusted_profile: Option<&TrustedAutomationProfile>,
+    context_refs: Vec<SendContextRef>,
 ) -> Result<(), HeadlessPipelineTermination> {
     // —— 解析托管状态（缺失说明 Chat V2 降级运行，headless 不可用）
     let pipeline = app
@@ -1646,8 +1879,23 @@ async fn execute_headless_pipeline(
         .filter(|&v| v > 0)
         .map(|v| v.clamp(1, MAX_TOOL_ROUNDS_CAP));
 
+    // 远程任务会话（IM 创建/推进）+ 飞书绑定路由：放行受控写工具白名单。
+    // 这些工具是 Medium 敏感度，仍逐次走审批——审批请求经 remote_approval
+    // 推送到用户飞书私聊，回复「批准 <码>」后执行；桌面端会话、自动化会话、
+    // 微信会话不进入此分支，维持纯只读白名单（fail-closed 语义不变）。
+    let remote_write = is_remote_task_session(session_id)
+        && super::remote_approval::write_tools_allowed_for(session_id);
+
     // —— system prompt 追加：headless 约束说明 + 调用方补充段
     let mut system_append = headless_system_prompt_note();
+    if remote_write {
+        system_append.push_str(
+            "\n\n本会话来自飞书远程任务：已启用受控写工具（题库录入/作答提交等）。\
+每次写操作都会向用户推送审批请求，用户回复「批准 <短码>」后才会执行；\
+被拒绝或超时即为最终决定，不要换参数重试或绕过审批。写操作执行前先在\
+回复中说明你要写什么。",
+        );
+    }
     if let Some(profile) = trusted_profile {
         system_append.push_str(&format!(
             "\n\nTrusted automation profile {} is active. Use only its pinned tools, roots, command prefixes, network domains and budgets; write operations must preserve rollback evidence.",
@@ -1662,6 +1910,16 @@ async fn execute_headless_pipeline(
     // —— 构建请求（工具双层 fail-closed：schema 白名单注入 + 执行白名单拦截）
     let mut schemas = headless_tool_schemas();
     let mut allowed_tools = headless_allowed_tools();
+    if remote_write {
+        schemas.extend(remote_task_write_tool_schemas());
+        allowed_tools.extend(
+            super::remote_approval::REMOTE_TASK_WRITE_TOOLS
+                .iter()
+                .map(|t| headless_wire_name(t)),
+        );
+        allowed_tools.sort();
+        allowed_tools.dedup();
+    }
     if let Some(profile) = trusted_profile {
         schemas.extend(trusted_profile_tool_schemas(profile));
         allowed_tools.extend(profile.allowed_tools.iter().cloned());
@@ -1708,7 +1966,13 @@ async fn execute_headless_pipeline(
         options: Some(options),
         user_message_id: None,
         assistant_message_id: Some(assistant_message_id.to_string()),
-        user_context_refs: None,
+        // IM 附件 / 自动化产物直通多模态编译路径：图片引用经上下文编译器
+        // 解析为 base64 喂给模型（与桌面端发图一致）；空列表保持 None 语义。
+        user_context_refs: if context_refs.is_empty() {
+            None
+        } else {
+            Some(context_refs)
+        },
         path_map: None,
         workspace_id: None,
     };

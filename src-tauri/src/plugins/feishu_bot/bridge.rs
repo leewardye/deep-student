@@ -35,6 +35,16 @@ fn node_bin() -> &'static str {
     "node"
 }
 
+/// Windows 下给子进程加 CREATE_NO_WINDOW：node.exe / npm.cmd 是控制台程序，
+/// GUI 进程直接 spawn 会弹出黑色控制台窗口（用户实测反馈过）。
+#[cfg(windows)]
+fn no_window(cmd: &mut Command) {
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+}
+
+#[cfg(not(windows))]
+fn no_window(_cmd: &mut Command) {}
+
 /// 在常见安装位置探测 node.exe（App 进程的 PATH 往往比终端窄，GUI 启动的
 /// 进程拿不到 shell 里注入的 PATH，需要主动兜底探测）。
 /// 返回 node.exe 的绝对路径；PATH 可用（`node --version` 成功）时返回 None 表示直接用 "node"。
@@ -98,13 +108,14 @@ fn find_node_exe_fallback() -> Option<PathBuf> {
 /// 解析可用的 node 可执行文件：优先 PATH（试跑 --version），失败后探测常见目录。
 async fn resolve_node_exe() -> Result<(PathBuf, Option<PathBuf>), AppError> {
     // PATH 直接可用？
-    let probe = tokio::process::Command::new(node_bin())
+    let mut probe_cmd = Command::new(node_bin());
+    probe_cmd
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+        .stderr(Stdio::null());
+    no_window(&mut probe_cmd);
+    let probe = probe_cmd.status().await;
     if matches!(probe, Ok(s) if s.success()) {
         return Ok((PathBuf::from(node_bin()), None));
     }
@@ -162,10 +173,13 @@ pub async fn ensure_ready(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
 async fn install_sdk(dir: &std::path::Path) -> Result<(), AppError> {
     let (node_path, node_dir) = resolve_node_exe().await?;
     let npm = npm_for_node(&node_path, node_dir);
-    let output = Command::new(&npm)
+    let mut npm_cmd = Command::new(&npm);
+    npm_cmd
         .args(["install", SDK_PACKAGE, "--no-audit", "--no-fund", "--loglevel", "error"])
         .current_dir(dir)
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    no_window(&mut npm_cmd);
+    let output = npm_cmd
         .output()
         .await
         .map_err(|e| {
@@ -211,7 +225,8 @@ pub async fn spawn(
 ) -> Result<BridgeProcess, AppError> {
     let script = ensure_ready(app).await?;
     let (node_path, _node_dir) = resolve_node_exe().await?;
-    let mut child = Command::new(&node_path)
+    let mut child = Command::new(&node_path);
+    child
         .arg(&script)
         .arg(app_id)
         .arg(app_secret)
@@ -219,7 +234,9 @@ pub async fn spawn(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    no_window(&mut child);
+    let mut child = child
         .spawn()
         .map_err(|e| {
             AppError::configuration(format!(

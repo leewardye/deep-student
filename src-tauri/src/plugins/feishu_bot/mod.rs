@@ -344,6 +344,27 @@ impl FeishuBotPlugin {
             .set_state(PLUGIN_ID, PluginState::Running, None)
             .await;
 
+        // 远程审批：注入 App 句柄 + 注册 IM 推送闭包（幂等，覆盖式）
+        self.tasks.set_app_handle(ctx.app.clone());
+        {
+            let app_for_push = ctx.app.clone();
+            crate::chat_v2::remote_approval::register_sender(Arc::new(
+                move |channel: &str, route: &str, text: &str| {
+                    if channel != task_command::CHANNEL_FEISHU {
+                        return;
+                    }
+                    let app = app_for_push.clone();
+                    let chat_id = route.to_string();
+                    let text = text.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) = push_feishu_text(&app, &chat_id, &text).await {
+                            tracing::warn!("[feishubot] remote approval push failed: {}", e);
+                        }
+                    });
+                },
+            ));
+        }
+
         let rate = RateLimiter::new(Self::read_rate_limit(&ctx.database));
         let task_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TASKS));
         let mut reconnect_failures: u32 = 0;
@@ -627,6 +648,7 @@ impl FeishuBotPlugin {
             message_id: dedup_key,
             text: full_text.clone(),
             chat,
+            context_refs: im_media::attachment_context_refs(&ingested),
         });
 
         match outcome {
@@ -804,6 +826,12 @@ async fn run_remote_task(
         );
         return;
     }
+    // 远程审批：登记会话路由（session_id → 飞书私聊），审批请求据此推送
+    crate::chat_v2::remote_approval::remember_route(
+        &session_id,
+        task_command::CHANNEL_FEISHU,
+        &chat_id,
+    );
     let mut turn =
         task_command::build_session_turn(&plan, session_id.clone(), model_id, system_append);
     turn.cancellation_token = Some(cancellation.clone());
@@ -1196,6 +1224,23 @@ pub async fn feishu_diagnose(app: tauri::AppHandle) -> Result<serde_json::Value,
             "机器人能力 → 开启机器人；测试号需把自己加入应用可用范围",
         ],
     }))
+}
+
+/// 远程审批推送：向指定私聊发送纯文本（分块），供 remote_approval 闭包调用。
+async fn push_feishu_text(
+    app: &tauri::AppHandle,
+    chat_id: &str,
+    text: &str,
+) -> Result<(), AppError> {
+    let db = app.state::<Arc<Database>>();
+    let creds = FeishuBotPlugin::load_credentials(&db)?.ok_or_else(|| {
+        AppError::validation("飞书凭证未配置，无法推送审批请求")
+    })?;
+    let client = FeishuClient::new();
+    for chunk in chunk_text(text, OUTBOUND_CHUNK_LIMIT) {
+        client.send_text(&creds, chat_id, &chunk).await?;
+    }
+    Ok(())
 }
 
 /// 桌面端向绑定的飞书私聊主动推送消息（文本/图片/文件）。

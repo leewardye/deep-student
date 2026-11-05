@@ -98,6 +98,15 @@ impl OcrEngineType {
     pub fn is_import_preferred(&self) -> bool {
         matches!(self, Self::Glm4vOcr)
     }
+
+    /// 是否支持 grounding 坐标输出（题目集导入 / 试卷切分依赖 bbox）
+    ///
+    /// Structured 任务排序时，具备坐标能力的引擎（GLM-4.6V / DeepSeek-OCR）
+    /// 恒排在无坐标引擎（PaddleOCR-VL、普通通用 VLM）之前，避免先在
+    /// 无坐标引擎上白耗一次请求再降级。
+    pub fn supports_grounding(&self) -> bool {
+        matches!(self, Self::DeepSeekOcr | Self::Glm4vOcr)
+    }
 }
 
 /// OCR 任务类型 — 决定引擎优先级排序策略

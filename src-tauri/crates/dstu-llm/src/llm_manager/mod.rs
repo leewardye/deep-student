@@ -3365,10 +3365,15 @@ fn build_ocr_runtime_candidates(
             }
         }),
         OcrTaskType::Structured => result.sort_by_key(|candidate| {
-            if candidate.engine_type().is_dedicated_ocr() {
-                1
-            } else {
+            let engine = candidate.engine_type();
+            if engine.supports_grounding() {
+                // 支持坐标输出的引擎恒在前（题目集导入/试卷切分依赖 bbox）
                 0
+            } else if engine.is_dedicated_ocr() {
+                // 无坐标的专用 OCR（如 PaddleOCR-VL）放最后
+                2
+            } else {
+                1
             }
         }),
     }
@@ -3461,6 +3466,101 @@ mod ocr_runtime_candidate_tests {
 
         let structured = build_ocr_runtime_candidates(&models, &[], OcrTaskType::Structured, true);
         assert!(structured.is_empty());
+    }
+
+    fn glm46v() -> (OcrModelConfig, ApiConfig) {
+        (
+            OcrModelConfig {
+                config_id: "glm46v".to_string(),
+                model: "glm-4.6v".to_string(),
+                engine_type: "glm4v_ocr".to_string(),
+                name: "GLM-4.6V".to_string(),
+                is_free: false,
+                enabled: true,
+                priority: 2,
+            },
+            ApiConfig {
+                id: "glm46v".to_string(),
+                model: "glm-4.6v".to_string(),
+                enabled: true,
+                is_multimodal: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn paddle_vl() -> (OcrModelConfig, ApiConfig) {
+        (
+            OcrModelConfig {
+                config_id: "paddle".to_string(),
+                model: "PaddlePaddle/PaddleOCR-VL-1.5".to_string(),
+                engine_type: "paddle_ocr_vl".to_string(),
+                name: "PaddleOCR-VL-1.5".to_string(),
+                is_free: true,
+                enabled: true,
+                priority: 0,
+            },
+            ApiConfig {
+                id: "paddle".to_string(),
+                model: "PaddlePaddle/PaddleOCR-VL-1.5".to_string(),
+                enabled: true,
+                is_multimodal: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn structured_prefers_grounding_capable_engines_over_plain_vlm() {
+        use crate::ocr_adapters::OcrEngineType;
+
+        // 用户优先级 Paddle(0) < 通用VLM(1) < GLM-4.6V(2)，但 Structured 任务
+        // 应把支持坐标输出的 GLM-4.6V 提到最前，无坐标的专用 OCR 垫底
+        let (paddle_model, paddle_config) = paddle_vl();
+        let (vlm_model, vlm_config) = generic_vlm();
+        let (glm_model, glm_config) = glm46v();
+        let configs = [paddle_config, vlm_config, glm_config];
+        let candidates = build_ocr_runtime_candidates(
+            &[paddle_model, vlm_model, glm_model],
+            &configs,
+            OcrTaskType::Structured,
+            false,
+        );
+        let engines: Vec<_> = candidates.iter().map(|c| c.engine_type()).collect();
+        assert_eq!(
+            engines,
+            vec![
+                OcrEngineType::Glm4vOcr,
+                OcrEngineType::GenericVlm,
+                OcrEngineType::PaddleOcrVl,
+            ]
+        );
+    }
+
+    #[test]
+    fn free_text_ordering_is_unchanged_by_grounding_sort() {
+        use crate::ocr_adapters::OcrEngineType;
+
+        // FreeText 仍按「专用 OCR 优先」排序，不受 Structured 新规则影响
+        let (paddle_model, paddle_config) = paddle_vl();
+        let (vlm_model, vlm_config) = generic_vlm();
+        let (glm_model, glm_config) = glm46v();
+        let configs = [paddle_config, vlm_config, glm_config];
+        let candidates = build_ocr_runtime_candidates(
+            &[paddle_model, vlm_model, glm_model],
+            &configs,
+            OcrTaskType::FreeText,
+            false,
+        );
+        let engines: Vec<_> = candidates.iter().map(|c| c.engine_type()).collect();
+        assert_eq!(
+            engines,
+            vec![
+                OcrEngineType::PaddleOcrVl,
+                OcrEngineType::Glm4vOcr,
+                OcrEngineType::GenericVlm,
+            ]
+        );
     }
 
     #[test]
@@ -7166,8 +7266,17 @@ impl LLMManager {
                 result.sort_by_key(|(_, engine)| if engine.is_dedicated_ocr() { 0 } else { 1 });
             }
             OcrTaskType::Structured => {
-                // 通用 VLM 在前（GLM-4.6V 等，复杂布局理解能力强），专业 OCR 在后
-                result.sort_by_key(|(_, engine)| if engine.is_dedicated_ocr() { 1 } else { 0 });
+                // 支持坐标输出的引擎最前（GLM-4.6V / DeepSeek-OCR），其次通用 VLM，
+                // 无坐标的专用 OCR（如 PaddleOCR-VL）最后，避免白耗一次请求
+                result.sort_by_key(|(_, engine)| {
+                    if engine.supports_grounding() {
+                        0
+                    } else if engine.is_dedicated_ocr() {
+                        2
+                    } else {
+                        1
+                    }
+                });
             }
         }
 
