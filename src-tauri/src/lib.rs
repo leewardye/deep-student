@@ -3186,6 +3186,7 @@ pub fn run() {
             ,crate::plugins::plugin_logout
             ,crate::plugins::plugin_unbind
             ,crate::plugins::feishu_bot::feishu_push_message
+            ,crate::plugins::feishu_bot::feishu_diagnose
             // =================================================
             // profiles（多用户账套）
             // =================================================

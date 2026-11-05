@@ -379,30 +379,50 @@ impl FeishuBotPlugin {
                         "bridge.error" => {
                             // 桥进程/SDK 错误必须让用户看得见（常见：appId 无效、
                             // 无事件订阅权限、长连接被踢等）
+                            DIAG.bridge_errors
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let msg = ev.data.as_str().unwrap_or("未知错误");
+                            diag_push_line(format!("[bridge-error] {}", msg));
                             let out = format!("飞书桥错误: {}", msg);
                             tracing::warn!("[feishubot] {}", out);
                             self.set_activity(&out);
                             events::emit_activity(&ctx.app, PLUGIN_ID, "error", &out);
                         }
                         "bridge.log" => {
-                            tracing::info!("[feishubot][bridge] {}", ev.data.as_str().unwrap_or(""));
+                            let msg = ev.data.as_str().unwrap_or("").to_string();
+                            diag_push_line(format!("[bridge] {}", msg));
+                            tracing::info!("[feishubot][bridge] {}", msg);
                         }
-                        "im.message.receive_v1" => match Self::normalize_event(&ev.data) {
-                            Some(inbound) => {
-                                self.handle_inbound(&ctx, &creds, &rate, &task_slots, inbound)
-                                    .await;
-                            }
-                            None => {
-                                // 事件被跳过时说明原因（群聊/不支持类型/解析失败），
-                                // 否则用户无法区分「没收到」和「收到但忽略了」
-                                if let Some(reason) = explain_skipped_event(&ev.data) {
-                                    tracing::info!("[feishubot] {}", reason);
-                                    self.set_activity(&reason);
-                                    events::emit_activity(&ctx.app, PLUGIN_ID, "warn", &reason);
+                        "im.message.receive_v1" => {
+                            DIAG.events_received
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            {
+                                if let Ok(mut g) = DIAG.last_event_at_ms.lock() {
+                                    *g = Some(now_ms_i64());
                                 }
                             }
-                        },
+                            match Self::normalize_event(&ev.data) {
+                                Some(inbound) => {
+                                    self.handle_inbound(&ctx, &creds, &rate, &task_slots, inbound)
+                                        .await;
+                                }
+                                None => {
+                                    // 事件被跳过时说明原因（群聊/不支持类型/解析失败），
+                                    // 否则用户无法区分「没收到」和「收到但忽略了」
+                                    if let Some(reason) = explain_skipped_event(&ev.data) {
+                                        diag_push_line(format!("[skipped] {}", reason));
+                                        tracing::info!("[feishubot] {}", reason);
+                                        self.set_activity(&reason);
+                                        events::emit_activity(
+                                            &ctx.app,
+                                            PLUGIN_ID,
+                                            "warn",
+                                            &reason,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     },
                     Ok(None) => { /* 空行，继续 */ }
@@ -419,6 +439,7 @@ impl FeishuBotPlugin {
                 (2u64.saturating_pow(reconnect_failures.min(5))).min(MAX_RECONNECT_DELAY_SECS),
             );
             let out = format!("连接断开，{} 秒后重连（第 {} 次）", delay.as_secs(), reconnect_failures);
+            diag_push_line(format!("[reconnect] {}", out));
             self.set_activity(&out);
             events::emit_activity(&ctx.app, PLUGIN_ID, "warn", &out);
             tracing::info!("[feishubot] reconnecting in {:?}...", delay);
@@ -987,6 +1008,170 @@ impl ChannelPlugin for FeishuBotPlugin {
 /// - 图片走 `POST /im/v1/images`（image_key），文件走 `POST /im/v1/files`
 ///   （file_key，file_type 为 multipart 表单字段）。
 /// - 任意一项失败即中止并返回错误（已发送的部分不回滚，与逐条发送语义一致）。
+#[tauri::command]
+// ---- 诊断（全局计数与最近桥接日志，进程内共享）----
+
+/// 飞书通道运行期诊断数据。全局静态：命令层与插件实例解耦，避免向下转型。
+struct FeishuDiag {
+    /// 收到的 im.message.receive_v1 事件总数（无论是否被处理）
+    events_received: std::sync::atomic::AtomicU64,
+    /// 桥进程错误行数
+    bridge_errors: std::sync::atomic::AtomicU64,
+    /// 最近一次收到消息事件的本地时间戳（ms）
+    last_event_at_ms: Mutex<Option<i64>>,
+    /// 最近 30 条桥接诊断行（bridge.log / bridge.error / 重连记录）
+    recent_lines: Mutex<std::collections::VecDeque<String>>,
+}
+
+static DIAG: std::sync::LazyLock<FeishuDiag> = std::sync::LazyLock::new(|| FeishuDiag {
+    events_received: std::sync::atomic::AtomicU64::new(0),
+    bridge_errors: std::sync::atomic::AtomicU64::new(0),
+    last_event_at_ms: Mutex::new(None),
+    recent_lines: Mutex::new(std::collections::VecDeque::with_capacity(32)),
+});
+
+fn diag_push_line(line: String) {
+    if let Ok(mut q) = DIAG.recent_lines.lock() {
+        if q.len() >= 30 {
+            q.pop_front();
+        }
+        q.push_back(line);
+    }
+}
+
+fn now_ms_i64() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn format_local_ms(ms: i64) -> String {
+    // 用 chrono 本地时区格式化（events.rs 已依赖 chrono）
+    chrono::DateTime::<chrono::Local>::from(
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms.max(0) as u64),
+    )
+    .format("%m-%d %H:%M:%S")
+    .to_string()
+}
+
+/// 飞书连接诊断：凭证/token/桥进程/事件流一次性体检。
+///
+/// 结果为结构化 JSON，前端「运行诊断」按钮直接渲染。注意：
+/// - 长连接是集群模式，诊断**不会**再开第二条 WS（会分摊走真连接的事件）
+/// - token 校验 = 真实调用飞书 REST，能同时验证 appId/secret/网络可达性
+/// - 平台侧配置（事件订阅/权限/版本发布）无法经 API 探测，只能由事件计数
+///   区分：events_received 持续为 0 而前几项全过 = 平台配置问题
+#[tauri::command]
+pub async fn feishu_diagnose(app: tauri::AppHandle) -> Result<serde_json::Value, AppError> {
+    use std::sync::Arc;
+    let db = app.state::<Arc<Database>>();
+    let creds = FeishuBotPlugin::load_credentials(&db)?;
+
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut all_ok = true;
+
+    // ① 凭证
+    match &creds {
+        Some(c) if c.is_complete() => items.push(json!({
+            "key": "credentials", "ok": true,
+            "detail": format!("已配置（App ID: {}）", c.app_id),
+        })),
+        _ => {
+            all_ok = false;
+            items.push(json!({
+                "key": "credentials", "ok": false,
+                "detail": "未配置或缺少 App ID / App Secret",
+            }));
+        }
+    }
+
+    // ② token（真实 REST 校验，顺带验证到 open.feishu.cn 的网络连通性）
+    if let Some(creds) = &creds {
+        let client = FeishuClient::new();
+        match client.tenant_access_token(creds).await {
+            Ok(_) => items.push(json!({
+                "key": "token", "ok": true,
+                "detail": "凭证有效（tenant_access_token 获取成功）",
+            })),
+            Err(e) => {
+                all_ok = false;
+                items.push(json!({
+                    "key": "token", "ok": false,
+                    "detail": format!("凭证校验失败（App Secret 错误或网络不通）: {}", e),
+                }));
+            }
+        }
+    }
+
+    // ③ 桥进程依赖（node + SDK 安装）
+    let bridge_dir = bridge::bridge_dir(&app)?;
+    let sdk_ready = bridge_dir
+        .join("node_modules")
+        .join("@larksuiteoapi")
+        .exists();
+    items.push(json!({
+        "key": "bridge_env", "ok": sdk_ready,
+        "detail": if sdk_ready {
+            format!("SDK 已就绪（{}）", bridge_dir.display())
+        } else {
+            format!("SDK 未安装（{}），插件启动时会自动 npm install", bridge_dir.display())
+        },
+    }));
+    if !sdk_ready {
+        all_ok = false;
+    }
+
+    // ④ 事件流（收到事件 = 平台配置全部正确、WS 正常推送）
+    let events = DIAG
+        .events_received
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let last_at = DIAG.last_event_at_ms.lock().ok().and_then(|g| *g);
+    let (events_ok, events_detail) = if events > 0 {
+        (
+            true,
+            format!(
+                "已收到 {} 条消息事件，最近一次 {}",
+                events,
+                last_at.map(format_local_ms).unwrap_or_default()
+            ),
+        )
+    } else {
+        (false, "尚未收到任何消息事件".to_string())
+    };
+    items.push(json!({
+        "key": "events", "ok": events_ok, "detail": events_detail,
+    }));
+
+    let recent: Vec<String> = DIAG
+        .recent_lines
+        .lock()
+        .map(|q| q.iter().cloned().collect())
+        .unwrap_or_default();
+
+    let bound_open_id = FeishuBotPlugin::read_bound_open_id(&db).unwrap_or_default();
+    let bound_chat_id = FeishuBotPlugin::read_setting(
+        &db,
+        &format!("{}bound_chat_id", SETTINGS_PREFIX),
+    )
+    .unwrap_or_default();
+
+    Ok(json!({
+        "all_ok": all_ok && events_ok,
+        "items": items,
+        "bound_open_id": bound_open_id,
+        "bound_chat_id": bound_chat_id,
+        "events_received": events,
+        "bridge_errors": DIAG.bridge_errors.load(std::sync::atomic::Ordering::Relaxed),
+        "recent_lines": recent,
+        "platform_checklist": [
+            "开发者后台 → 事件与回调 → 订阅方式必须选「使用长连接接收事件」",
+            "事件与回调 → 添加事件 im.message.receive_v1（接收消息）",
+            "权限管理 → 开通 im:message（发消息）与 im:message.p2p:readonly（读私聊）",
+            "版本管理与发布 → 创建版本并发布（权限/事件变更后需发新版本）",
+            "机器人能力 → 开启机器人；测试号需把自己加入应用可用范围",
+        ],
+    }))
+}
+
+/// 桌面端向绑定的飞书私聊主动推送消息（文本/图片/文件）。
 #[tauri::command]
 pub async fn feishu_push_message(
     app: tauri::AppHandle,

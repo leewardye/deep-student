@@ -372,6 +372,7 @@ commands.allow = [
   "export_unified_backup_data",
   "fetch_vendor_models",
   "feishu_push_message",
+  "feishu_diagnose",
   "filestream_check_access",
   "fsrs_bury_card",
   "fsrs_enqueue_cards",

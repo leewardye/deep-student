@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { ArrowLeft, GearSix, QrCode, Plug, WarningCircle } from '@phosphor-icons/react';
+import { ArrowLeft, GearSix, QrCode, Plug, WarningCircle, CheckCircle } from '@phosphor-icons/react';
 import { DsButton } from '@/components/ui/DsButton';
 import { CustomScrollArea } from '@/components/custom-scroll-area';
 import { Input } from '@/components/ui/shad/Input';
@@ -20,6 +20,7 @@ import { SettingRow, SettingsGroup, SwitchRow } from '../settingsTabPrimitives';
 import {
   pluginsApi,
   PLUGIN_EVENTS,
+  type FeishuDiagnosis,
   type IlinkBotConfig,
   type PluginInfo,
   type PluginState,
@@ -73,6 +74,34 @@ export const IlinkBotConfigPanel: React.FC<IlinkBotConfigPanelProps> = ({
   const [unbindOpen, setUnbindOpen] = useState(false);
   const [activityLog, setActivityLog] = useState<string[]>([]);
   const [showFeishuCreds, setShowFeishuCreds] = useState(false);
+  const [diagRunning, setDiagRunning] = useState(false);
+  const [testSending, setTestSending] = useState(false);
+  const [diagResult, setDiagResult] = useState<FeishuDiagnosis | null>(null);
+
+  const runFeishuDiagnosis = useCallback(async () => {
+    setDiagRunning(true);
+    try {
+      setDiagResult(await pluginsApi.diagnoseFeishu());
+    } catch (e) {
+      showGlobalNotification('error', getErrorMessage(e));
+    } finally {
+      setDiagRunning(false);
+    }
+  }, []);
+
+  const sendFeishuTestMessage = useCallback(async () => {
+    setTestSending(true);
+    try {
+      await pluginsApi.pushFeishuMessage(
+        t('settings:plugins.diag_test_text'),
+      );
+      showGlobalNotification('success', t('settings:plugins.diag_test_ok'));
+    } catch (e) {
+      showGlobalNotification('error', getErrorMessage(e));
+    } finally {
+      setTestSending(false);
+    }
+  }, [t]);
 
   const refreshConfig = useCallback(async () => {
     try {
@@ -358,7 +387,24 @@ export const IlinkBotConfigPanel: React.FC<IlinkBotConfigPanelProps> = ({
                 </div>
               )}
               {plugin.id === 'feishubot' && (
-                <div className="px-1 py-2.5">
+                <div className="flex flex-wrap gap-2 px-1 py-2.5">
+                  <DsButton
+                    size="sm"
+                    variant="outline"
+                    disabled={busy || diagRunning}
+                    onClick={() => void runFeishuDiagnosis()}
+                  >
+                    <GearSix className="h-4 w-4" />
+                    {diagRunning ? t('settings:plugins.diag_running') : t('settings:plugins.diag_run')}
+                  </DsButton>
+                  <DsButton
+                    size="sm"
+                    variant="outline"
+                    disabled={busy || testSending}
+                    onClick={() => void sendFeishuTestMessage()}
+                  >
+                    {testSending ? t('settings:plugins.diag_test_sending') : t('settings:plugins.diag_test_send')}
+                  </DsButton>
                   <DsButton
                     size="sm"
                     variant="outline"
@@ -471,6 +517,55 @@ export const IlinkBotConfigPanel: React.FC<IlinkBotConfigPanelProps> = ({
             />
           </SettingRow>
         </SettingsGroup>
+
+        {/* 飞书诊断结果 */}
+        {plugin.id === 'feishubot' && diagResult && (
+          <SettingsGroup title={t('settings:plugins.diag_result_title')}>
+            <div className="space-y-1.5 px-1 py-2">
+              {diagResult.items.map((item) => (
+                <div key={item.key} className="flex items-start gap-2 text-sm leading-relaxed">
+                  {item.ok ? (
+                    <CheckCircle className="w-4 h-4 mt-0.5 shrink-0 text-emerald-500" weight="fill" />
+                  ) : (
+                    <WarningCircle className="w-4 h-4 mt-0.5 shrink-0 text-destructive" />
+                  )}
+                  <span className={item.ok ? 'text-muted-foreground' : 'text-foreground'}>
+                    {item.detail}
+                  </span>
+                </div>
+              ))}
+              {!diagResult.events_received && diagResult.all_ok === false && (
+                <p className="pt-1 text-xs leading-relaxed text-muted-foreground/80">
+                  {t('settings:plugins.diag_events_zero_hint')}
+                </p>
+              )}
+              {diagResult.recent_lines.length > 0 && (
+                <div className="pt-1">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    {t('settings:plugins.diag_recent_lines')}
+                  </p>
+                  <ul className="mt-1 space-y-0.5 text-xs leading-relaxed text-muted-foreground/70">
+                    {diagResult.recent_lines.map((line, i) => (
+                      <li key={`${i}-${line}`} className="break-all font-mono">{line}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {!diagResult.events_received && (
+                <div className="pt-1">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    {t('settings:plugins.diag_checklist_title')}
+                  </p>
+                  <ol className="mt-1 list-decimal space-y-0.5 px-4 text-xs leading-relaxed text-muted-foreground/80">
+                    {diagResult.platform_checklist.map((line, i) => (
+                      <li key={i}>{line}</li>
+                    ))}
+                  </ol>
+                </div>
+              )}
+            </div>
+          </SettingsGroup>
+        )}
 
         {/* 错误与最近活动 */}
         {(status?.lastError || plugin.error) && (

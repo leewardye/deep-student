@@ -17,6 +17,7 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { StoreApi } from 'zustand';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { ChatV2TauriAdapter } from '../adapters/TauriAdapter';
 import { adapterManager } from '../adapters/AdapterManager';
 import type { AdapterLease } from '../adapters/AdapterManager';
@@ -413,6 +414,31 @@ export function useTauriAdapter(
       adapterRef.current = null;
     };
   }, [sessionId, store, initialize]);
+
+  // IM/自动化 headless turn 的流式事件在后端被丢弃（无窗口运行），桌面端若在
+  // turn 执行期间打开该会话只会看到空内容。后端在 turn 完成时广播
+  // remote_sessions_changed（带 session_id）；是当前打开的会话就重载一次，
+  // 让落库的消息立即可见（否则要切走再切回才会出现）。
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    void listen<{ session_id?: string }>('chat_v2://remote_sessions_changed', (ev) => {
+      const sid = ev.payload?.session_id;
+      if (!sid || sid !== sessionIdRef.current) return;
+      if (adapterRef.current) {
+        void adapterRef.current.loadSession().catch(() => {});
+      }
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   // 🚀 性能优化：使用 useMemo 稳定返回值，避免每次渲染创建新对象导致消费者重渲染
   return useMemo(

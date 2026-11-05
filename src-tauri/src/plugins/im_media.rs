@@ -101,6 +101,51 @@ pub fn is_allowed_attachment(filename: Option<&str>, mime: Option<&str>, extra: 
     false
 }
 
+/// AttachKind 的英文标识（生成兜底文件名用）
+fn kind_name(kind: AttachKind) -> &'static str {
+    match kind {
+        AttachKind::Image => "image",
+        AttachKind::File => "file",
+        AttachKind::Audio => "audio",
+        AttachKind::Video => "video",
+    }
+}
+
+/// 依据文件头魔数嗅探扩展名（微信/飞书的图片消息不带文件名，传输途中
+/// 文件也可能被改名/去扩展名，文件名解析失败时以内容为准）。
+pub fn sniff_ext(bytes: &[u8]) -> Option<&'static str> {
+    let starts = |sig: &[u8]| bytes.starts_with(sig);
+    if starts(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if starts(b"\xff\xd8\xff") {
+        Some("jpg")
+    } else if starts(b"GIF87a") || starts(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() > 12 && starts(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if starts(b"BM") {
+        Some("bmp")
+    } else if starts(b"%PDF") {
+        Some("pdf")
+    } else if starts(b"PK\x03\x04") || starts(b"PK\x05\x06") {
+        // zip 容器：可能是 docx/xlsx/pptx，也可能是普通 zip —— 按扩展名
+        // 白名单里都允许，落盘名优先沿用原始文件名，这里给通用 zip
+        Some("zip")
+    } else if bytes.len() > 11 && &bytes[4..8] == b"ftyp" {
+        Some("mp4")
+    } else if starts(b"ID3") || (bytes.len() > 2 && bytes[0] == 0xff && (bytes[1] & 0xe0) == 0xe0) {
+        Some("mp3")
+    } else if starts(b"fLaC") {
+        Some("flac")
+    } else if starts(b"\x1aE\xdf\xa3") {
+        Some("mkv")
+    } else if starts(b"OggS") {
+        Some("ogg")
+    } else {
+        None
+    }
+}
+
 /// 清洗文件名：去路径分隔符与控制字符，限长 80 字符，空则回退 kind 名
 pub fn sanitize_filename(filename: Option<&str>, kind: AttachKind) -> String {
     let raw = filename
@@ -165,18 +210,40 @@ pub fn ingest(
             MAX_ATTACHMENT_BYTES / 1024 / 1024
         )));
     }
-    if !is_allowed_attachment(filename, None, extra_ext) {
+    // 扩展名解析：文件名 → 魔数嗅探。文件名扩展名未知/缺失时以文件头为准
+    // （微信/飞书图片消息不带文件名；传输中被改名为 .bin 也在此兜底）。
+    let ext_from_name: Option<String> = filename.and_then(|n| {
+        Path::new(n)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+    });
+    let sniffed = sniff_ext(bytes).map(str::to_string);
+    let in_list =
+        |e: &str| ALLOWED_EXTENSIONS.contains(&e) || extra_ext.iter().any(|x| x == e);
+    let effective_ext: Option<String> = match ext_from_name {
+        Some(e) if in_list(&e) => Some(e),
+        _ => sniffed.clone().filter(|e| in_list(e)),
+    };
+    // 图片类消息（拍照错题主场景）即使嗅探不出也放行：IM 图片端点返回的
+    // 必然是图片，宁可落盘也不拦用户的错题
+    let image_fallback = matches!(kind, AttachKind::Image);
+    if effective_ext.is_none() && !image_fallback {
         return Err(AppError::validation(format!(
             "不支持的附件类型（扩展名不在白名单，可在插件设置补充）：{}",
-            filename
-                .and_then(|n| Path::new(n)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_string))
-                .unwrap_or_else(|| "未知".to_string())
+            ext_from_name.unwrap_or_else(|| "未知".to_string())
         )));
     }
-    let display_name = sanitize_filename(filename, kind);
+    let display_ext = effective_ext
+        .or(sniffed)
+        .unwrap_or_else(|| "jpg".to_string());
+    let display_name = match filename.map(str::trim) {
+        Some(name) if !name.is_empty() => sanitize_filename(Some(name), kind),
+        _ => sanitize_filename(
+            Some(&format!("{}_{}.{}", kind_name(kind), index + 1, display_ext)),
+            kind,
+        ),
+    };
     let safe_msg_id: String = msg_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
@@ -330,6 +397,20 @@ mod tests {
         let out = sanitize_filename(Some(&long), AttachKind::Image);
         assert!(out.chars().count() <= 80);
         assert!(out.ends_with(".png"));
+    }
+
+    #[test]
+    fn sniff_detects_common_signatures() {
+        assert_eq!(sniff_ext(b"\x89PNG\r\n\x1a\n...."), Some("png"));
+        assert_eq!(sniff_ext(b"\xff\xd8\xff\xe0rest"), Some("jpg"));
+        assert_eq!(sniff_ext(b"%PDF-1.7 ..."), Some("pdf"));
+        assert_eq!(sniff_ext(b"PK\x03\x04....."), Some("zip"));
+        assert_eq!(sniff_ext(b"GIF89a...."), Some("gif"));
+        // WEBP：RIFF 头 + 偏移 8 的 WEBP 标记
+        let webp = b"RIFF\x24\x00\x00\x00WEBPVP8 ";
+        assert_eq!(sniff_ext(webp), Some("webp"));
+        assert_eq!(sniff_ext(b"not a known format at all"), None);
+        assert_eq!(sniff_ext(b""), None);
     }
 
     #[test]
