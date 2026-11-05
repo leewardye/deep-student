@@ -211,7 +211,7 @@ pub async fn spawn(
 ) -> Result<BridgeProcess, AppError> {
     let script = ensure_ready(app).await?;
     let (node_path, _node_dir) = resolve_node_exe().await?;
-    let child = Command::new(&node_path)
+    let mut child = Command::new(&node_path)
         .arg(&script)
         .arg(app_id)
         .arg(app_secret)
