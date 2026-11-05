@@ -41,7 +41,7 @@ fn node_bin() -> &'static str {
 fn find_node_exe_fallback() -> Option<PathBuf> {
     use std::env;
     let mut candidates: Vec<PathBuf> = Vec::new();
-    let push_env = |vars: &[&str]| {
+    let mut push_env = |vars: &[&str]| {
         for v in vars {
             if let Ok(val) = env::var(v) {
                 candidates.push(PathBuf::from(val).join("nodejs").join("node.exe"));
@@ -53,7 +53,7 @@ fn find_node_exe_fallback() -> Option<PathBuf> {
         let nvm = PathBuf::from(&appdata).join("nvm");
         candidates.push(nvm.join("node.exe"));
         // nvm-windows: %APPDATA%\nvm\v22.x.x\node.exe，取字典序最大（即最新）
-        if let Ok(mut rd) = std::fs::read_dir(&nvm) {
+        if let Ok(rd) = std::fs::read_dir(&nvm) {
             let mut versions: Vec<PathBuf> = rd
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.join("node.exe").exists())
@@ -80,7 +80,7 @@ fn find_node_exe_fallback() -> Option<PathBuf> {
             .join("binaries")
             .join("node")
             .join("versions");
-        if let Ok(mut rd) = std::fs::read_dir(&wb) {
+        if let Ok(rd) = std::fs::read_dir(&wb) {
             let mut versions: Vec<PathBuf> = rd
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.join("node.exe").exists())
@@ -228,12 +228,14 @@ pub async fn spawn(
                 e
             ))
         })?;
-    let stdout = child.stdout.ok_or_else(|| {
-        AppError::internal("飞书桥子进程 stdout 不可用")
-    })?;
-    let stderr = child.stderr.ok_or_else(|| {
-        AppError::internal("飞书桥子进程 stderr 不可用")
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::internal("飞书桥子进程 stdout 不可用"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::internal("飞书桥子进程 stderr 不可用"))?;
     Ok(BridgeProcess {
         child,
         stdout: BufReader::new(stdout),
