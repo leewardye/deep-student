@@ -221,8 +221,8 @@ pub fn ingest(
     let sniffed = sniff_ext(bytes).map(str::to_string);
     let in_list =
         |e: &str| ALLOWED_EXTENSIONS.contains(&e) || extra_ext.iter().any(|x| x == e);
-    let effective_ext: Option<String> = match ext_from_name {
-        Some(e) if in_list(&e) => Some(e),
+    let effective_ext: Option<String> = match &ext_from_name {
+        Some(e) if in_list(e) => Some(e.clone()),
         _ => sniffed.clone().filter(|e| in_list(e)),
     };
     // 图片类消息（拍照错题主场景）即使嗅探不出也放行：IM 图片端点返回的
