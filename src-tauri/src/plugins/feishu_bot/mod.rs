@@ -54,7 +54,7 @@ const MAX_RECONNECT_DELAY_SECS: u64 = 30;
 const DESC: PluginDescriptor = PluginDescriptor {
     id: PLUGIN_ID,
     label: "飞书机器人",
-    blurb: "通过飞书自建应用（长连接模式，无需公网 IP）收发文字、图片与文件，并由本地 AI 自动处理。首条私聊消息将自动绑定发送者。",
+    blurb: "接入飞书自建应用（长连接模式，无需公网 IP），可收发文字、图片与文件，由本地 AI 自动处理。使用步骤：① 填入 App ID / App Secret 并保存；② 在飞书开放平台为应用开通机器人、订阅 im.message.receive_v1 事件、申请 im:message 等权限并发布版本；③ 给机器人发一条私聊消息即自动绑定。收不到回复时点「运行诊断」查看原因。",
     kind: PluginKind::Channel,
 };
 

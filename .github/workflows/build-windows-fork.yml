@@ -99,10 +99,15 @@ jobs:
           find src-tauri/target/release/bundle -type f \( -name "*.exe" -o -name "*.zip" -o -name "*.sig" \) -exec cp {} dist-upload/ \;
           ls -la dist-upload/
 
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: DeepStudent-Windows-unsigned
+          name: DeepStudent-Windows-v${{ steps.ver.outputs.version }}-unsigned
           path: dist-upload/
           if-no-files-found: error
           retention-days: 14
