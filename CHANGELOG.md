@@ -10,6 +10,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.14.0] - 2026-11-06（构建中，发布后本行移除）
+
+### Features
+
+* **profile（学生身份）:** 账套升级为「学生档案」——新增学生姓名/年级（14 档枚举）/学校/头像（emoji，零迁移）字段；顶栏新增「当前学生」切换器（弹层选择、切换确认、重启遮罩、跳转设置）；设置页档案卡片支持身份编辑表单 ([a9e3cc0](https://github.com/leewardye/deep-student/commit/a9e3cc0))
+* **profile（学习者画像）:** 设置页新增学习者画像表单（学习偏好/学习目标/薄弱知识点/近期状态），全量保存与 AI 的 merge 更新互不覆盖；「AI 辅助完善」一键把引导问题投进聊天输入框，AI 面试后自动写入画像 ([a9e3cc0](https://github.com/leewardye/deep-student/commit/a9e3cc0))
+* **ai:** 每轮对话 system prompt 注入 `<student_identity>`（姓名/年级/学校），AI 自动按学段调整讲解深度与难度 ([a9e3cc0](https://github.com/leewardye/deep-student/commit/a9e3cc0))
+* **grading:** 作文批改 grade_level 未指定时自动回退到当前学生登记的年级（初中→middle_school、高中→high_school、大学→college） ([a9e3cc0](https://github.com/leewardye/deep-student/commit/a9e3cc0))
+
+### Fixed
+
+* **profiles:** profile_update 借用冲突（E0502）导致 CI 构建失败 ([a9e3cc0](https://github.com/leewardye/deep-student/commit/a9e3cc0))
+
+## [0.13.0] - 2026-11-05
+
+### Features
+
+* **im（图片直通）:** 飞书/微信收到的图片附件内嵌 base64 直送模型，修复「图片已入库但模型读不到内容」；附件落盘即构造 SendContextRef，经任务路由→无头会话三层传递填入 user_context_refs ([4eebaf0](https://github.com/leewardye/deep-student/commit/4eebaf0))
+* **im（远程审批流）:** 远程任务会话（飞书路由）放行题库写操作白名单（创建题目/批量导入/导入文档/提交答案/收藏切换）；执行前推送审批消息，回复「批准 + 6 位短码」确认执行，撤销/过期自动失效 ([4eebaf0](https://github.com/leewardye/deep-student/commit/4eebaf0))
+* **ocr:** Structured 任务（题目导入/检索）引擎排序升级三档——支持 grounding 坐标的引擎（GLM-4.6V、DeepSeek-OCR）恒优先，其次通用 VLM，最后无坐标专用 OCR；FreeText 排序不变 ([4eebaf0](https://github.com/leewardye/deep-student/commit/4eebaf0))
+* **im（文案）:** 机器人 7 类回复重写（创建/继续/忙线/完成/超时/失败/停止），带任务目标预览，支持「批准/拒绝 + 短码」解析 ([4eebaf0](https://github.com/leewardye/deep-student/commit/4eebaf0))
+
+### Fixed
+
+* **im（飞书桥）:** Windows 下消除黑色控制台窗口（CREATE_NO_WINDOW）；配 0.12.2 的进程持有/EOF 重连修复后桥接稳定 ([4eebaf0](https://github.com/leewardye/deep-student/commit/4eebaf0))
+
+## [0.12.2] - 2026-11-05
+
+### Fixed
+
+* **im（飞书桥）:** 桥进程被 kill_on_drop 立即误杀导致「诊断全绿但 0 事件」——改为 BridgeProcess 结构体持有进程，EOF 触发 bridge.exit 重连；stderr 并入事件循环；node/npm 路径探测兜底（PATH 缺失时按 nvm/volta/scoop/WorkBuddy 内置顺序查找） ([ec1631e](https://github.com/leewardye/deep-student/commit/ec1631e))
+
 ## [0.11.0](https://github.com/helixnow/deep-student/compare/v0.10.10...v0.11.0) (2026-11-01)
 
 

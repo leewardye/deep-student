@@ -98,16 +98,16 @@ jobs:
         shell: bash
         run: |
           LOG="$RUNNER_TEMP/build.log"
-          # 编译错误（error[E...] / error: / error[E0xxx]:）+ 前后文，输出为 annotation 便于无日志权限时排查
-          { grep -nE "error(\[E[0-9]+\])?:|error: " "$LOG" | tail -40 || true; } > /tmp/errs.txt
+          # 宽匹配：rustc error / vite "error during build" / MSVC linker LNK / panic / bundler
+          grep -nE "error(\[E[0-9]+\])?:|error during|LNK[0-9]+|panicked|failed to|Failure reason|Error " "$LOG" | tail -40 > /tmp/errs.txt
           if [ -s /tmp/errs.txt ]; then
             while IFS= read -r line; do
-              echo "::error::$(echo "$line" | cut -c1-380)"
+              echo "::error::$(echo "$line" | cut -c1-500)"
             done < /tmp/errs.txt
           else
-            echo "::error::No error lines matched; last 60 lines follow"
-            tail -60 "$LOG" | while IFS= read -r line; do
-              echo "::error::$(echo "$line" | cut -c1-380)"
+            echo "::error::No error lines matched; last 40 lines follow"
+            tail -40 "$LOG" | while IFS= read -r line; do
+              echo "::error::$(echo "$line" | cut -c1-500)"
             done
           fi
 
