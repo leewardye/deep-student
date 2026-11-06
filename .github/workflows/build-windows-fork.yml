@@ -90,7 +90,26 @@ jobs:
           export RUSTC_WRAPPER=sccache
           # 只打 NSIS：tauri.conf.json 的 targets 为 "all" 时 Windows 会连 MSI 一起打，
           # 而 WiX light.exe 在 CI 上反复失败（且 Collect artifacts 不收 .msi）
-          npx tauri build --bundles nsis
+          set -o pipefail
+          npx tauri build --bundles nsis 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Report build errors (annotations)
+        if: failure()
+        shell: bash
+        run: |
+          LOG="$RUNNER_TEMP/build.log"
+          # 编译错误（error[E...] / error: / error[E0xxx]:）+ 前后文，输出为 annotation 便于无日志权限时排查
+          { grep -nE "error(\[E[0-9]+\])?:|error: " "$LOG" | tail -40 || true; } > /tmp/errs.txt
+          if [ -s /tmp/errs.txt ]; then
+            while IFS= read -r line; do
+              echo "::error::$(echo "$line" | cut -c1-380)"
+            done < /tmp/errs.txt
+          else
+            echo "::error::No error lines matched; last 60 lines follow"
+            tail -60 "$LOG" | while IFS= read -r line; do
+              echo "::error::$(echo "$line" | cut -c1-380)"
+            done
+          fi
 
       - name: Collect artifacts
         shell: bash
