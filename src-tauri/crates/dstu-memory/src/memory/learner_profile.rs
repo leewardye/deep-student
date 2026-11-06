@@ -1003,6 +1003,150 @@ where
     })
 }
 
+/// 设置页表单全量写回（表单保存路径专用）。
+///
+/// 与 merge 更新并存：AI 路径继续走 [`apply_profile_update`]（增量、防清空），
+/// 表单是用户在看到最新画像后的**显式保存动作**，拥有完全权威——可以清空
+/// 偏好/近期状态字段（merge 补丁对空串跳过，无法表达清除）。仍走 CAS 重试
+/// 与字符上限校验。mastery 来源的薄弱点被移除后，后续成绩回流仍可能重新
+/// 写入（回流管道语义不变）。
+pub fn save_profile_from_form(
+    service: &MemoryService,
+    desired: &LearnerProfile,
+    source: MemoryOpSource,
+    reason: &str,
+) -> VfsResult<LearnerProfileApplyOutcome> {
+    let vfs_db = service.vfs_db_ref().clone();
+
+    for attempt in 0..PROFILE_CAS_MAX_RETRIES {
+        let snapshot = load_profile_snapshot(&vfs_db)?;
+        let mut profile = snapshot
+            .as_ref()
+            .map(|(_, profile)| profile.clone())
+            .unwrap_or_default();
+
+        // 变更检测（只比较表单管理的四个字段；version/updated_at/指纹不参与）
+        let changed = profile.weak_points != desired.weak_points
+            || profile.preferences != desired.preferences
+            || profile.goals != desired.goals
+            || profile.recent_status != desired.recent_status;
+        if !changed {
+            return Ok(LearnerProfileApplyOutcome {
+                profile,
+                changed: false,
+            });
+        }
+
+        profile.weak_points = desired.weak_points.clone();
+        profile.preferences = desired.preferences.clone();
+        profile.goals = desired.goals.clone();
+        profile.recent_status = desired
+            .recent_status
+            .clone()
+            .filter(|s| !s.trim().is_empty());
+        profile.version = profile.version.saturating_add(1);
+        profile.updated_at = chrono::Utc::now().to_rfc3339();
+
+        let rendered_chars = profile.rendered_char_count();
+        if rendered_chars > LEARNER_PROFILE_MAX_CHARS {
+            return Err(VfsError::InvalidArgument {
+                param: "profile".to_string(),
+                reason: format!(
+                    "画像 {} 字符，超过 {} 字符硬上限。请精简后再保存。",
+                    rendered_chars, LEARNER_PROFILE_MAX_CHARS
+                ),
+            });
+        }
+        let json = profile.to_json();
+
+        let persisted = match &snapshot {
+            Some((note, _)) => match VfsNoteRepo::update_note(
+                &vfs_db,
+                &note.note_id,
+                VfsUpdateNoteParams {
+                    title: None,
+                    content: Some(json.clone()),
+                    tags: None,
+                    expected_updated_at: Some(note.updated_at),
+                },
+            ) {
+                Ok(_) => true,
+                Err(VfsError::Conflict { .. }) => false,
+                Err(error) if super::is_retryable_sqlite_lock(&error) => false,
+                Err(error) => return Err(error),
+            },
+            None => {
+                let _guard = super::lock_memory_structure();
+                if load_profile_snapshot(&vfs_db)?.is_some() {
+                    false
+                } else {
+                    let sys_folder_id = service.get_or_create_system_folder_id_unlocked()?;
+                    let note = VfsNoteRepo::create_note_in_folder(
+                        &vfs_db,
+                        VfsCreateNoteParams {
+                            title: LEARNER_PROFILE_NOTE_TITLE.to_string(),
+                            content: json.clone(),
+                            tags: vec!["_system".to_string()],
+                        },
+                        Some(&sys_folder_id),
+                    )?;
+                    if let Err(e) = VfsIndexStateRepo::mark_disabled_with_reason(
+                        &vfs_db,
+                        &note.resource_id,
+                        "system learner profile note",
+                    ) {
+                        warn!(
+                            "[LearnerProfile] Failed to disable indexing for profile note: {}",
+                            e
+                        );
+                    }
+                    true
+                }
+            }
+        };
+
+        if !persisted {
+            debug!(
+                "[LearnerProfile] CAS conflict on form-save attempt {}; retrying",
+                attempt + 1
+            );
+            super::backoff_memory_write(attempt);
+            continue;
+        }
+
+        if let Err(e) = append_profile_history(service, &profile) {
+            warn!("[LearnerProfile] Failed to append profile history: {}", e);
+        }
+        service.audit_logger().log(&MemoryAuditEntry {
+            source,
+            operation: MemoryOpType::Update,
+            success: true,
+            note_id: None,
+            title: Some(LEARNER_PROFILE_NOTE_TITLE.to_string()),
+            content_preview: Some(reason.to_string()),
+            folder: Some("__system__".to_string()),
+            event: Some("PROFILE_UPDATE".to_string()),
+            confidence: None,
+            reason: Some(reason.to_string()),
+            session_id: None,
+            duration_ms: None,
+            extra_json: Some(
+                serde_json::json!({ "learner_profile_version": profile.version }).to_string(),
+            ),
+        });
+
+        return Ok(LearnerProfileApplyOutcome {
+            profile,
+            changed: true,
+        });
+    }
+
+    Err(VfsError::Conflict {
+        key: "learner_profile.conflict".to_string(),
+        message: "The learner profile remained busy after repeated retries.".to_string(),
+    })
+}
+
 fn get_or_create_system_folder_id_unlocked(vfs_db: &Arc<VfsDatabase>) -> VfsResult<String> {
     let config = MemoryConfig::new(vfs_db.clone());
     let root_id = config.get_or_create_root_folder()?;

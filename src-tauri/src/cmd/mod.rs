@@ -13,6 +13,7 @@ pub mod enhanced_anki;
 pub mod fsrs_review;
 pub mod handout;
 pub mod helpers;
+pub mod learner_profile; // 学习者画像设置页读写
 pub mod mcp;
 pub use dstu_media::cmd::media; // compress_image（上传前图片压缩，已迁至 dstu-media）
 pub mod network;

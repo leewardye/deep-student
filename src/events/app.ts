@@ -101,7 +101,8 @@ export type SettingsTabId =
   | 'voice-input'
   | 'memory'
   | 'workbench'
-  | 'document-processing';
+  | 'document-processing'
+  | 'profiles';
 
 export interface SettingsNavigateTabDetail {
   tab: SettingsTabId;

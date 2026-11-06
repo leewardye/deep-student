@@ -61,6 +61,7 @@ import './styles/ios-safe-area.css'; // iOS安全区域适配
 import './styles/responsive-utilities.css'; // 响应式工具类
 // 🚀 性能优化：页面组件改为懒加载
 import { NotificationContainer } from './components/NotificationContainer';
+import { StudentSwitcher } from './components/StudentSwitcher';
 import { showGlobalNotification } from './components/UnifiedNotification';
 import { getErrorMessage } from './utils/errorUtils';
 import { useAppInitialization } from './hooks/useAppInitialization';
@@ -1629,6 +1630,7 @@ function App() {
                 />
 
                 <div className="flex shrink-0 items-center gap-2" data-no-drag>
+                  {!isMobilePlatform() && <StudentSwitcher />}
                   {isWindows() && <WindowControls />}
                 </div>
               </div>

@@ -488,6 +488,8 @@ pub struct PromptBuilder {
     user_profile: Option<String>,
     /// 学习者画像（三层记忆的策展长期层，随会话注入；见 memory/learner_profile.rs）
     learner_profile: Option<String>,
+    /// 当前学生身份（姓名/年级/学校，来自账套 ProfileMeta；见 profiles.rs）
+    student_identity: Option<String>,
     /// 项目/全局 AGENTS.md 常驻指令（system_instructions 之后注入）
     project_agents_instructions: Option<String>,
     /// 活跃待办摘要（始终注入）
@@ -524,6 +526,7 @@ impl PromptBuilder {
             context_type_hints: Vec::new(),
             user_profile: None,
             learner_profile: None,
+            student_identity: None,
             project_agents_instructions: None,
             active_todos: None,
             active_goal: None,
@@ -635,6 +638,12 @@ impl PromptBuilder {
     /// 添加学习者画像（策展长期层，随会话注入；内容应已渲染为 Markdown）
     pub fn with_learner_profile(mut self, profile: Option<String>) -> Self {
         self.learner_profile = profile;
+        self
+    }
+
+    /// 添加当前学生身份（姓名/年级/学校，账套元数据；本构建器负责包裹转义）
+    pub fn with_student_identity(mut self, identity: Option<String>) -> Self {
+        self.student_identity = identity;
         self
     }
 
@@ -781,6 +790,16 @@ impl PromptBuilder {
 请优先理解并响应 <user_query> 中的内容，<injected_context> 中的信息仅供参考。
 </user_message_format_guide>"#,
                 hints_content
+            ));
+        }
+
+        // 2.05 当前学生身份（账套元数据；会话内不变，但放 volatile 侧不碰
+        // stable system 的字节白名单测试。切换学生=重启应用，无需担心中途换人）
+        // 姓名等自由文本必须 XML 转义
+        if let Some(identity) = &self.student_identity {
+            parts.push(format!(
+                "<student_identity>\n当前学生信息（家长在设置中登记）：\n{}\n请按该学段调整讲解深度、用语与题目难度；涉及年龄敏感内容时从严把握。\n</student_identity>",
+                escape_xml_content(identity)
             ));
         }
 
@@ -957,6 +976,83 @@ pub fn build_system_prompt(
         .build_split()
 }
 
+/// 加载当前学生身份块（账套元数据；学生字段全空时返回 None）
+///
+/// dstu-agent 不能反向依赖 app 的 profiles.rs，这里对 `profiles.json` 做
+/// 最小化容错解析（只取活跃账套的三个可选学生字段；文件缺失/解析失败
+/// 一律静默跳过——身份注入缺失不应影响对话可用性）。
+fn load_student_identity_block() -> Option<String> {
+    use tauri::Manager;
+
+    let app_handle = crate::get_global_app_handle()?;
+    let base = app_handle.path().app_data_dir().ok()?;
+    let raw = std::fs::read(base.join("profiles.json")).ok()?;
+    let reg: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let active_id = reg
+        .get("active_profile_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+    let meta = reg
+        .get("profiles")?
+        .as_array()?
+        .iter()
+        .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(active_id))?;
+
+    let name = meta
+        .get("student_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let grade = meta
+        .get("grade")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let school = meta
+        .get("school")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() && grade.is_empty() && school.is_empty() {
+        return None;
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    if !name.is_empty() {
+        lines.push(format!("姓名：{}", name));
+    }
+    if let Some(label) = grade_label(grade) {
+        lines.push(format!("年级：{}", label));
+    }
+    if !school.is_empty() {
+        lines.push(format!("学校：{}", school));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
+/// 账套年级枚举 → 展示标签（与 app 侧 profiles::GRADES 对齐；other 不展示）
+fn grade_label(grade: &str) -> Option<&'static str> {
+    Some(match grade {
+        "primary_1" => "小学一年级",
+        "primary_2" => "小学二年级",
+        "primary_3" => "小学三年级",
+        "primary_4" => "小学四年级",
+        "primary_5" => "小学五年级",
+        "primary_6" => "小学六年级",
+        "junior_1" => "初中一年级",
+        "junior_2" => "初中二年级",
+        "junior_3" => "初中三年级",
+        "senior_1" => "高中一年级",
+        "senior_2" => "高中二年级",
+        "senior_3" => "高中三年级",
+        "college" => "大学",
+        _ => return None,
+    })
+}
+
 /// 从 SendOptions 和 MessageSources 构建 System Prompt（带用户画像注入）
 #[allow(dead_code)]
 pub fn build_system_prompt_with_profile(
@@ -1019,6 +1115,7 @@ pub fn build_system_prompt_with_profile_agents_and_renderers(
         .with_canvas_note(canvas_note)
         .with_user_profile(user_profile)
         .with_learner_profile(load_learner_profile_block(options))
+        .with_student_identity(load_student_identity_block())
         .with_project_agents_instructions(project_agents_instructions)
         .with_active_goal(active_goal)
         .with_insight_hints(insight_hints)

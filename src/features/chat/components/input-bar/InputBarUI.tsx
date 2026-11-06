@@ -923,8 +923,9 @@ const InputBarUIInner: React.FC<InputBarUIProps> = ({
     });
   }, [processPreparedFilesToAttachments, isUploadScopeCurrent, t]);
 
-  // 别的页面交给本会话的文件（PDF 框选截图等）：与粘贴同一条附件流程
-  useChatInputInbox(sessionId, isReady, processFilesToAttachments);
+  // 别的页面交给本会话的文件（PDF 框选截图等）：与粘贴同一条附件流程；
+  // 预填文本（AI 辅助完善画像等）：直接写入输入框草稿
+  useChatInputInbox(sessionId, isReady, processFilesToAttachments, onInputChange);
 
   // ========== 相机拍照处理 ==========
   // R3 能力三分离：拍照入口按「平台/捕获能力」判定（Android/iOS，或

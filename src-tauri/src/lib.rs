@@ -2135,6 +2135,8 @@ pub fn run() {
             crate::cmd::network::network_probe,
             // 媒体讲义（docs/dev/media-learning §3）与笔记 → Word 导出
             crate::cmd::handout::handout_llm_complete,
+            crate::cmd::learner_profile::learner_profile_get,
+            crate::cmd::learner_profile::learner_profile_save,
             crate::cmd::handout::handout_vlm_caption,
             crate::cmd::handout::handout_cancel,
             crate::cmd::handout::handout_release,
@@ -3193,6 +3195,7 @@ pub fn run() {
             ,crate::profiles::profile_list
             ,crate::profiles::profile_create
             ,crate::profiles::profile_rename
+            ,crate::profiles::profile_update
             ,crate::profiles::profile_delete
             ,crate::profiles::profile_switch
         ])

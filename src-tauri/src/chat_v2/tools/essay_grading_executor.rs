@@ -60,6 +60,26 @@ const MAX_WAIT_TIMEOUT_MS: u64 = 100_000;
 /// 批改结果回传给 LLM 的最大字符数（防止上下文膨胀；完整结果始终可经 essay_get_result 获取）
 const MAX_RESULT_CHARS_IN_TOOL_OUTPUT: usize = 2_000;
 
+/// 活跃账套年级枚举 → 作文批改 grade_level 词汇。
+///
+/// junior_*→middle_school、senior_*→high_school、college→college；
+/// primary_* 保持空（流水线尚无小学评判档，宁缺勿错）；未登记年级返回空串
+/// （保持历史行为）。
+fn profile_grade_to_essay_level() -> String {
+    let Some(grade) = crate::profiles::active_profile_grade() else {
+        return String::new();
+    };
+    if grade.starts_with("junior_") {
+        "middle_school".to_string()
+    } else if grade.starts_with("senior_") {
+        "high_school".to_string()
+    } else if grade == "college" {
+        "college".to_string()
+    } else {
+        String::new()
+    }
+}
+
 // ============================================================================
 // 后台批改任务注册表
 // ============================================================================
@@ -274,6 +294,13 @@ impl EssayGradingExecutor {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // 学生身份联动（0.14.0）：AI 未填 grade_level 时回退到活跃账套登记的年级，
+        // 让批改评判标准自动跟随「当前学生」设置
+        let grade_level = if grade_level.is_empty() {
+            profile_grade_to_essay_level()
+        } else {
+            grade_level
+        };
         let custom_prompt = call
             .arguments
             .get("custom_prompt")

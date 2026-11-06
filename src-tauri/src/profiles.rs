@@ -52,6 +52,74 @@ pub struct ProfileMeta {
     pub name: String,
     pub created_at_ms: u64,
     pub last_used_at_ms: u64,
+    // ── 学生身份层（2026-11-06，全部可选，旧注册表零迁移）──
+    /// 学生姓名（展示用，区别于账套名 name）
+    #[serde(default)]
+    pub student_name: Option<String>,
+    /// 年级（枚举见 GRADES）
+    #[serde(default)]
+    pub grade: Option<String>,
+    /// 学校（可选）
+    #[serde(default)]
+    pub school: Option<String>,
+    /// 头像 emoji（可选；None 时前端按 id 派生色板 + 首字）
+    #[serde(default)]
+    pub avatar: Option<String>,
+}
+
+/// 合法年级枚举（与作文批改 grade_level 对齐的映射在联动层做）
+pub const GRADES: &[&str] = &[
+    "primary_1", "primary_2", "primary_3", "primary_4", "primary_5", "primary_6",
+    "junior_1", "junior_2", "junior_3",
+    "senior_1", "senior_2", "senior_3",
+    "college", "other",
+];
+
+/// 学生姓名上限（字符数）
+const STUDENT_NAME_MAX_CHARS: usize = 20;
+/// 学校名上限（字符数）
+const SCHOOL_MAX_CHARS: usize = 40;
+/// 头像 emoji 上限（字符数，容纳组合 emoji）
+const AVATAR_MAX_CHARS: usize = 8;
+
+/// 归一化可选文本字段：trim 后为空 → None；超长报错
+fn normalize_optional_text(
+    value: Option<String>,
+    field_label: &str,
+    max_chars: usize,
+) -> Result<Option<String>, AppError> {
+    match value {
+        None => Ok(None),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if trimmed.chars().count() > max_chars {
+                return Err(AppError::validation(format!(
+                    "{}不能超过 {} 个字符",
+                    field_label, max_chars
+                )));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
+fn validate_grade(grade: Option<String>) -> Result<Option<String>, AppError> {
+    match grade {
+        None => Ok(None),
+        Some(g) => {
+            if g.is_empty() {
+                return Ok(None);
+            }
+            if GRADES.contains(&g.as_str()) {
+                Ok(Some(g))
+            } else {
+                Err(AppError::validation(format!("不支持的年级: {}", g)))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +145,10 @@ impl ProfileRegistry {
                 name: "默认账套".to_string(),
                 created_at_ms: t,
                 last_used_at_ms: t,
+                student_name: None,
+                grade: None,
+                school: None,
+                avatar: None,
             }],
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
         }
@@ -93,6 +165,25 @@ impl ProfileRegistry {
 
 fn registry_path(base_app_data_dir: &Path) -> PathBuf {
     base_app_data_dir.join(REGISTRY_FILE)
+}
+
+/// 活跃账套登记的年级枚举（供作文批改 grade_level 缺省联动等场景）。
+///
+/// 只读、无锁争用风险之外无副作用；注册表缺失/解析失败一律返回 None
+/// （身份信息缺失不应阻断功能）。
+pub fn active_profile_grade() -> Option<String> {
+    let app = crate::get_global_app_handle()?;
+    let base = app.path().app_data_dir().ok()?;
+    let reg = load_registry(&base);
+    let meta = reg
+        .profiles
+        .iter()
+        .find(|p| p.id == reg.active_id())?;
+    let grade = meta.grade.as_deref()?.trim();
+    if grade.is_empty() || grade == "other" {
+        return None;
+    }
+    Some(grade.to_string())
 }
 
 fn load_registry(base_app_data_dir: &Path) -> ProfileRegistry {
@@ -209,6 +300,11 @@ pub struct ProfileInfo {
     pub is_default: bool,
     /// 数据根绝对路径（调试/展示用）
     pub data_root: String,
+    // ── 学生身份层 ──
+    pub student_name: Option<String>,
+    pub grade: Option<String>,
+    pub school: Option<String>,
+    pub avatar: Option<String>,
 }
 
 fn to_info(base: &Path, reg: &ProfileRegistry, meta: &ProfileMeta) -> ProfileInfo {
@@ -220,6 +316,10 @@ fn to_info(base: &Path, reg: &ProfileRegistry, meta: &ProfileMeta) -> ProfileInf
         active: meta.id == reg.active_id(),
         is_default: meta.id == DEFAULT_PROFILE_ID,
         data_root: data_root_for(base, &meta.id).display().to_string(),
+        student_name: meta.student_name.clone(),
+        grade: meta.grade.clone(),
+        school: meta.school.clone(),
+        avatar: meta.avatar.clone(),
     }
 }
 
@@ -258,6 +358,10 @@ pub fn profile_create(
         name,
         created_at_ms: t,
         last_used_at_ms: t,
+        student_name: None,
+        grade: None,
+        school: None,
+        avatar: None,
     };
     // 预建数据目录（A/B slots 由 data_space 启动逻辑按需创建，这里只建根）
     let root = data_root_for(&base, &id);
@@ -291,6 +395,47 @@ pub fn profile_rename(
         .ok_or_else(|| AppError::validation(format!("账套 {} 不存在", profile_id)))?;
     meta.name = name;
     save_registry(&base, &reg)
+}
+
+/// 更新学生身份字段（全量语义：四个字段都以 Some 传入，空串 = 清除）。
+#[tauri::command]
+pub fn profile_update(
+    app: tauri::AppHandle,
+    profile_id: String,
+    student_name: Option<String>,
+    grade: Option<String>,
+    school: Option<String>,
+    avatar: Option<String>,
+) -> Result<ProfileInfo, AppError> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::internal(format!("获取应用数据目录失败: {}", e)))?;
+    let student_name = normalize_optional_text(
+        student_name,
+        "学生姓名",
+        STUDENT_NAME_MAX_CHARS,
+    )?;
+    let grade = validate_grade(grade)?;
+    let school =
+        normalize_optional_text(school, "学校名称", SCHOOL_MAX_CHARS)?;
+    let avatar = normalize_optional_text(avatar, "头像", AVATAR_MAX_CHARS)?;
+    let _g = registry_lock()
+        .lock()
+        .map_err(|_| AppError::internal("账套注册表锁不可用"))?;
+    let mut reg = load_registry(&base);
+    let meta = reg
+        .profiles
+        .iter_mut()
+        .find(|p| p.id == profile_id)
+        .ok_or_else(|| AppError::validation(format!("账套 {} 不存在", profile_id)))?;
+    meta.student_name = student_name;
+    meta.grade = grade;
+    meta.school = school;
+    meta.avatar = avatar;
+    save_registry(&base, &reg)?;
+    let updated = meta.clone();
+    Ok(to_info(&base, &reg, &updated))
 }
 
 #[tauri::command]
@@ -409,11 +554,25 @@ mod tests {
             name: "测试".into(),
             created_at_ms: 1,
             last_used_at_ms: 2,
+            student_name: Some("小明".into()),
+            grade: Some("junior_2".into()),
+            school: None,
+            avatar: None,
         });
         save_registry(&base, &reg).unwrap();
         let reloaded = load_registry(&base);
         assert_eq!(reloaded.profiles.len(), 2);
         assert_eq!(reloaded.profiles[1].name, "测试");
+        // 学生身份字段 round-trip
+        assert_eq!(reloaded.profiles[1].student_name.as_deref(), Some("小明"));
+        assert_eq!(reloaded.profiles[1].grade.as_deref(), Some("junior_2"));
+
+        // 旧 schema（无学生字段）也能读，缺省 None
+        let legacy = r#"{"schema_version":1,"profiles":[{"id":"p-old","name":"旧","created_at_ms":1,"last_used_at_ms":2}],"active_profile_id":"p-old"}"#;
+        std::fs::write(registry_path(&base), legacy).unwrap();
+        let old = load_registry(&base);
+        assert!(old.profiles[0].student_name.is_none());
+        assert!(old.profiles[0].grade.is_none());
 
         // 写坏 JSON → 重建默认账套（fail-safe，不崩启动）
         std::fs::write(registry_path(&base), b"{not json").unwrap();
@@ -429,5 +588,21 @@ mod tests {
         assert!(validate_name("   ").is_err());
         assert!(validate_name(&"长".repeat(NAME_MAX_CHARS + 1)).is_err());
         assert!(validate_name(&"短".repeat(NAME_MAX_CHARS)).is_ok());
+    }
+
+    #[test]
+    fn normalize_optional_text_rules() {
+        assert_eq!(normalize_optional_text(Some("  张三 ".into()), "学生姓名", 20).unwrap(), Some("张三".into()));
+        assert_eq!(normalize_optional_text(Some("   ".into()), "学生姓名", 20).unwrap(), None);
+        assert_eq!(normalize_optional_text(None, "学生姓名", 20).unwrap(), None);
+        assert!(normalize_optional_text(Some("长".repeat(21)), "学生姓名", 20).is_err());
+    }
+
+    #[test]
+    fn validate_grade_rules() {
+        assert_eq!(validate_grade(Some("junior_2".into())).unwrap(), Some("junior_2".into()));
+        assert_eq!(validate_grade(Some(String::new())).unwrap(), None);
+        assert_eq!(validate_grade(None).unwrap(), None);
+        assert!(validate_grade(Some("grade_99".into())).is_err());
     }
 }
