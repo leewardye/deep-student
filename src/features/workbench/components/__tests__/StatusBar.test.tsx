@@ -838,3 +838,35 @@ describe('StatusBar autohide', () => {
     expect(bar.hasAttribute('data-hidden')).toBe(false);
   });
 });
+
+describe('StatusBar · 当前学生切换器', () => {
+  const getSwitcher = (bar: HTMLElement): Element | null =>
+    bar.querySelector('[data-tour-id="student-switcher"]');
+
+  it('工作台菜单栏渲染当前学生标识（0.14.0 曾漏挂，回归锁）', async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'profile_list') {
+        return [
+          { id: 'p1', name: '账套A', active: true, student_name: '小明', grade: 'junior', avatar: '😀' },
+          { id: 'p2', name: '账套B', active: false, student_name: null, grade: null, avatar: null },
+        ];
+      }
+      return { due: 0 };
+    });
+    render(<StatusBar />);
+    const bar = await screen.findByTestId('wb-menubar');
+    const switcher = getSwitcher(bar);
+    expect(switcher).toBeTruthy();
+    expect(switcher?.textContent).toContain('小明');
+  });
+
+  it('profile_list 返回非数组时不崩溃（防御 mock/异常）', async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'profile_list') return { due: 0 } as unknown;
+      return { due: 0 };
+    });
+    render(<StatusBar />);
+    const bar = await screen.findByTestId('wb-menubar');
+    expect(getSwitcher(bar)).toBeTruthy();
+  });
+});

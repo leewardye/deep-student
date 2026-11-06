@@ -49,8 +49,16 @@ function gradeLabel(grade: string | null, t: (k: string, opts?: Record<string, u
  *
  * 学生 = 账套（profiles）。切换会重启应用（数据根隔离，与设置 → 学生档案
  * 中的切换同一语义），点击菜单项先弹确认。身份编辑入口在设置页。
+ *
+ * onManage：覆盖「管理学生」的打开方式。默认走主窗口 NAVIGATE_TO_TAB；
+ * 工作台模式（StatusBar）传 launchApp('settings')——设置在工作台是独立窗口，
+ * 不吃主窗口的视图切换事件。
  */
-export function StudentSwitcher({ className }: { className?: string }) {
+export function StudentSwitcher({ className, onManage }: {
+  className?: string;
+  /** 提供时替代默认的主窗口跳转（setPendingSettingsTab 已在调用前写入） */
+  onManage?: () => void;
+}) {
   const { t } = useTranslation(['settings', 'common']);
   const [profiles, setProfiles] = useState<StudentProfileInfo[]>([]);
   const [open, setOpen] = useState(false);
@@ -60,7 +68,8 @@ export function StudentSwitcher({ className }: { className?: string }) {
   const refresh = useCallback(async () => {
     try {
       const list = await invoke<StudentProfileInfo[]>('profile_list');
-      setProfiles(list);
+      // 防御：后端异常/测试 mock 返回非数组时不把 undefined 灌进 state
+      setProfiles(Array.isArray(list) ? list : []);
     } catch {
       // 顶栏标识是装饰性信息，失败静默（不弹通知打扰）
     }
@@ -88,8 +97,12 @@ export function StudentSwitcher({ className }: { className?: string }) {
   const goManage = useCallback(() => {
     setOpen(false);
     setPendingSettingsTab('profiles');
+    if (onManage) {
+      onManage();
+      return;
+    }
     dispatchAppEvent(APP_EVENTS.NAVIGATE_TO_TAB, { tabName: 'settings' });
-  }, []);
+  }, [onManage]);
 
   const handleSwitch = useCallback(async (target: StudentProfileInfo) => {
     setRestarting(true);

@@ -10,7 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.14.0] - 2026-11-06（构建中，发布后本行移除）
+## [0.14.1] - 2026-11-06（构建中）
+
+### Fixed
+
+* **profile（学生切换器）:** 工作台模式（学习桌面）顶栏漏挂「当前学生」切换器——0.14.0 只挂在了标准主窗口顶栏，工作台的 StatusBar（wb-menubar）没有；现补挂到菜单栏设置按钮左侧，「管理学生」入口改走 `launchApp('settings')`（工作台设置是独立窗口，不吃主窗口视图切换事件，挂载时消费 pendingSettingsTab 落到学生档案页） ([待提交](https://github.com/leewardye/deep-student/commits))
+* **profile（学生切换器）:** `profile_list` 返回非数组时组件崩溃——加 `Array.isArray` 防御；StatusBar 单测新增 2 条回归锁（共 36 条全过）
+
+## [0.14.0] - 2026-11-06
 
 ### Features
 

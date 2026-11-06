@@ -28,6 +28,7 @@ import {
 } from '@phosphor-icons/react';
 import { DeepStudentMark } from '@/components/ui/DeepStudentLogo';
 import { WindowControls } from '@/components/WindowControls';
+import { StudentSwitcher } from '@/components/StudentSwitcher';
 import { toggleAppsPanel } from './appsPanelStore';
 import { useDesktopName } from './desktopNameStore';
 import { StatusBarBrandMenu } from './StatusBarBrandMenu';
@@ -43,7 +44,7 @@ import {
   type AutomationSummary,
 } from '@/features/settings/components/automationSettingsApi';
 import { usePomodoroStore } from '@/features/pomodoro/stores/usePomodoroStore';
-import { isMacOS, isWindows } from '@/utils/platform';
+import { isMacOS, isWindows, isMobilePlatform } from '@/utils/platform';
 import {
   getFlashcardsDueCount,
   subscribeFlashcardsDueCount,
@@ -607,6 +608,12 @@ const StatusBarComponent: React.FC = () => {
             automation={automation}
           />
         </div>
+
+        {/* 当前学生标识与切换：与主窗口顶栏同款；工作台设置是独立窗口，
+            管理入口改走 launchApp（Settings 挂载时消费 pendingSettingsTab） */}
+        {!isMobilePlatform() ? (
+          <StudentSwitcher onManage={() => launchApp('settings')} />
+        ) : null}
 
         <button
           type="button"
