@@ -424,17 +424,20 @@ pub fn profile_update(
         .lock()
         .map_err(|_| AppError::internal("账套注册表锁不可用"))?;
     let mut reg = load_registry(&base);
-    let meta = reg
-        .profiles
-        .iter_mut()
-        .find(|p| p.id == profile_id)
-        .ok_or_else(|| AppError::validation(format!("账套 {} 不存在", profile_id)))?;
-    meta.student_name = student_name;
-    meta.grade = grade;
-    meta.school = school;
-    meta.avatar = avatar;
+    // meta 持有 reg 的可变借用，克隆快照后结束借用，再落盘（避免 E0502）
+    let updated = {
+        let meta = reg
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == profile_id)
+            .ok_or_else(|| AppError::validation(format!("账套 {} 不存在", profile_id)))?;
+        meta.student_name = student_name;
+        meta.grade = grade;
+        meta.school = school;
+        meta.avatar = avatar;
+        meta.clone()
+    };
     save_registry(&base, &reg)?;
-    let updated = meta.clone();
     Ok(to_info(&base, &reg, &updated))
 }
 
