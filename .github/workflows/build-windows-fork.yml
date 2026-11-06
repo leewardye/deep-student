@@ -98,15 +98,17 @@ jobs:
         shell: bash
         run: |
           LOG="$RUNNER_TEMP/build.log"
-          # 宽匹配：rustc error / vite "error during build" / MSVC linker LNK / panic / bundler
-          grep -nE "error(\[E[0-9]+\])?:|error during|LNK[0-9]+|panicked|failed to|Failure reason|Error " "$LOG" | tail -40 > /tmp/errs.txt
+          # cargo/tauri 错误行带 ANSI 颜色码（error 与 [E0502]: 之间有 \x1b[0m），
+          # 先剥码再匹配，否则 grep 抓不到真正的编译错误
+          sed -r 's/\x1b\[[0-9;]*[mGKH]//g' "$LOG" > /tmp/clean.log
+          grep -nE "error(\[E[0-9]+\])?:|error: |error during|LNK[0-9]+|panicked|could not compile|build failed|Failure reason" /tmp/clean.log | tail -30 > /tmp/errs.txt
           if [ -s /tmp/errs.txt ]; then
             while IFS= read -r line; do
               echo "::error::$(echo "$line" | cut -c1-500)"
             done < /tmp/errs.txt
           else
             echo "::error::No error lines matched; last 40 lines follow"
-            tail -40 "$LOG" | while IFS= read -r line; do
+            tail -40 /tmp/clean.log | while IFS= read -r line; do
               echo "::error::$(echo "$line" | cut -c1-500)"
             done
           fi
