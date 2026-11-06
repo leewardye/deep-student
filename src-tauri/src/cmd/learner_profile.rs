@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tauri::State;
 
-use super::commands::AppState;
+use crate::commands::AppState;
 use crate::memory::learner_profile::{self, LearnerProfile, LEARNER_PROFILE_MAX_CHARS};
 use crate::memory::{MemoryOpSource, MemoryService};
 use crate::models::AppError;
