@@ -1067,7 +1067,8 @@ pub fn save_profile_from_form(
                     title: None,
                     content: Some(json.clone()),
                     tags: None,
-                    expected_updated_at: Some(note.updated_at),
+                    // note 是 &VfsNote（match &snapshot），String 不能 move 出共享引用
+                    expected_updated_at: Some(note.updated_at.clone()),
                 },
             ) {
                 Ok(_) => true,
