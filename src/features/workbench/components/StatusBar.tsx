@@ -610,9 +610,14 @@ const StatusBarComponent: React.FC = () => {
         </div>
 
         {/* 当前学生标识与切换：与主窗口顶栏同款；工作台设置是独立窗口，
-            管理入口改走 launchApp（Settings 挂载时消费 pendingSettingsTab） */}
+            管理入口改走 launchApp（Settings 挂载时消费 pendingSettingsTab）。
+            必须 pointer-events-auto：菜单栏两侧容器是 none，否则点击穿透到全幅
+            drag-region，变成拖窗 / 双击还原（0.14.1 实测） */}
         {!isMobilePlatform() ? (
-          <StudentSwitcher onManage={() => launchApp('settings')} />
+          <StudentSwitcher
+            className="pointer-events-auto"
+            onManage={() => launchApp('settings')}
+          />
         ) : null}
 
         <button

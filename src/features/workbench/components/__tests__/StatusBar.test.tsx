@@ -858,6 +858,9 @@ describe('StatusBar · 当前学生切换器', () => {
     const switcher = getSwitcher(bar);
     expect(switcher).toBeTruthy();
     expect(switcher?.textContent).toContain('小明');
+    // 回归锁：菜单栏两侧容器 pointer-events:none，切换器必须自恢复 auto，
+    // 否则点击穿透到全幅 drag-region（单击拖窗 / 双击还原窗口）
+    expect(switcher?.classList.contains('pointer-events-auto')).toBe(true);
   });
 
   it('profile_list 返回非数组时不崩溃（防御 mock/异常）', async () => {

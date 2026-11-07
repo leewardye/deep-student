@@ -10,7 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.14.1] - 2026-11-06（构建中）
+## [0.14.2] - 2026-11-06（构建中）
+
+### Fixed
+
+* **workbench（学生切换器点击穿透）:** 学习桌面顶栏的学生切换器可见但点不动，点击区域被当成拖拽层（单击拖窗、双击还原窗口）——菜单栏两侧容器是 `pointer-events: none`（只有 `.wb-menubar-item` 显式恢复），切换器根节点是普通 div，事件穿透到全幅 drag-region；现显式 `pointer-events-auto` 并加回归锁（断言 class 存在）
+* **settings（账户管理）:** 设置侧栏「账套管理」正名为「账户管理」（英文 Accounts），描述改为「每个学生一个账户」口径；切换器菜单入口同步为「新建学生账户…／管理账户…」，中英双份
+
+## [0.14.1] - 2026-11-06
 
 ### Fixed
 
